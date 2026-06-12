@@ -80,15 +80,15 @@
 }
 
 .quotahalo-usage-menu {
-  width: 316px;
-  min-width: 316px;
-  max-width: 316px;
+  width: 420px;
+  min-width: 420px;
+  max-width: 420px;
 }
 
 .quotahalo-system-menu {
-  width: 316px;
-  min-width: 316px;
-  max-width: 316px;
+  width: 420px;
+  min-width: 420px;
+  max-width: 420px;
 }
 
 .quotahalo-usage-menu .popup-menu-content,
@@ -238,10 +238,29 @@
   background-color: rgba(45, 212, 191, 0.08);
 }
 
+.quotahalo-update-row {
+  spacing: 10px;
+}
+
 .quotahalo-update-label {
   color: rgba(153, 246, 228, 0.96);
   font-size: 12px;
   font-weight: 700;
+}
+
+.quotahalo-update-button {
+  min-width: 72px;
+  min-height: 24px;
+  border-radius: 5px;
+  background-color: rgba(45, 212, 191, 0.13);
+  border: 1px solid rgba(45, 212, 191, 0.28);
+  color: rgba(153, 246, 228, 0.98);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.quotahalo-update-button:hover {
+  background-color: rgba(45, 212, 191, 0.20);
 }
 
 .quotahalo-meta-item {

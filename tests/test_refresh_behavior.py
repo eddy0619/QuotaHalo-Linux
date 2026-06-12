@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import subprocess
 import tempfile
 import time
 import unittest
@@ -463,8 +464,66 @@ class RefreshBehaviorTests(unittest.TestCase):
         self.assertNotIn("'Usage unavailable  ·  ' + error", extension_text)
         self.assertNotIn("changelog.replace", extension_text)
         self.assertNotIn("current ' + current", extension_text)
-        self.assertIn("width: 316px;", stylesheet_text)
-        self.assertIn("max-width: 316px;", stylesheet_text)
+        self.assertIn("width: 420px;", stylesheet_text)
+        self.assertIn("max-width: 420px;", stylesheet_text)
+
+    def test_self_updater_refuses_dirty_workspace(self):
+        calls = []
+
+        def runner(command, cwd=None):
+            calls.append(list(command))
+            if command[:2] == ["git", "rev-parse"]:
+                return subprocess.CompletedProcess(command, 0, stdout="true\n", stderr="")
+            if command[:3] == ["git", "status", "--porcelain"]:
+                return subprocess.CompletedProcess(command, 0, stdout=" M quota_halo_status.py\n", stderr="")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = qhs.SelfUpdater(repo_dir=Path(tmp), runner=runner).update("v0.1.1-test")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("uncommitted changes", result["error"].lower())
+        self.assertNotIn(["git", "fetch", "--tags", "origin"], calls)
+
+    def test_self_updater_creates_backup_before_checkout_and_install(self):
+        calls = []
+
+        def runner(command, cwd=None):
+            calls.append(list(command))
+            if command[:3] == ["git", "status", "--porcelain"]:
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = qhs.SelfUpdater(
+                repo_dir=Path(tmp),
+                runner=runner,
+                now=lambda: 1781265604.0,
+            ).update("v0.1.1-test")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["target_version"], "v0.1.1-test")
+        self.assertIn(["git", "branch", "backup/before-update-20260612-200004", "HEAD"], calls)
+        self.assertIn(["git", "fetch", "--tags", "origin"], calls)
+        self.assertIn(["git", "rev-parse", "--verify", "refs/tags/v0.1.1-test"], calls)
+        self.assertIn(["git", "checkout", "--detach", "tags/v0.1.1-test"], calls)
+        self.assertIn([str(Path(tmp) / "install-gnome-extension.sh")], calls)
+
+    def test_extension_update_row_has_update_button_and_golden_width(self):
+        root = Path(__file__).resolve().parents[1]
+        extension_text = (
+            root / "gnome-extension" / "quotahalo@local" / "extension.js"
+        ).read_text(encoding="utf-8")
+        stylesheet_text = (
+            root / "gnome-extension" / "quotahalo@local" / "stylesheet.css"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("_addUpdateItem", extension_text)
+        self.assertIn("self._requestSelfUpdate(update.latest_version)", extension_text)
+        self.assertIn("--self-update", extension_text)
+        self.assertIn("quotahalo-update-button", stylesheet_text)
+        self.assertIn("width: 420px;", stylesheet_text)
+        self.assertIn("max-width: 420px;", stylesheet_text)
 
 
 if __name__ == "__main__":

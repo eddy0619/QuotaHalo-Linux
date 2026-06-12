@@ -438,6 +438,75 @@ class VersionChecker:
         return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
 
 
+class SelfUpdater:
+    TAG_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+
+    def __init__(self, repo_dir=None, runner=None, now=None):
+        self.repo_dir = Path(repo_dir or PROJECT_DIR)
+        self.runner = runner or self._default_runner
+        self.now = now or time.time
+
+    def update(self, target_version):
+        target = str(target_version or "").strip()
+        if not target or not self.TAG_PATTERN.match(target):
+            return self._failure("Invalid target version.")
+
+        try:
+            self._run(["git", "rev-parse", "--is-inside-work-tree"])
+            self._run(["git", "rev-parse", "--verify", "HEAD"])
+            dirty = self._run(["git", "status", "--porcelain"]).stdout.strip()
+            if dirty:
+                return self._failure(
+                    "Refusing to update because the repository has uncommitted changes."
+                )
+
+            backup = self._backup_branch_name()
+            self._run(["git", "branch", backup, "HEAD"])
+            self._run(["git", "fetch", "--tags", "origin"])
+            self._run(["git", "rev-parse", "--verify", f"refs/tags/{target}"])
+            self._run(["git", "checkout", "--detach", f"tags/{target}"])
+            self._run([str(self.repo_dir / "install-gnome-extension.sh")])
+            return {
+                "ok": True,
+                "target_version": target,
+                "backup_branch": backup,
+                "message": (
+                    f"Updated to {target}. Current code was preserved at {backup}. "
+                    "Reload GNOME Shell to load the installed extension."
+                ),
+            }
+        except Exception as e:
+            return self._failure(str(e))
+
+    def _run(self, command):
+        result = self.runner(list(command), cwd=self.repo_dir)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(detail or f"Command failed: {' '.join(command)}")
+        return result
+
+    def _backup_branch_name(self):
+        stamp = datetime.fromtimestamp(float(self.now())).strftime("%Y%m%d-%H%M%S")
+        return f"backup/before-update-{stamp}"
+
+    @staticmethod
+    def _default_runner(command, cwd=None):
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    @staticmethod
+    def _failure(message):
+        return {
+            "ok": False,
+            "error": str(message or "Update failed."),
+        }
+
+
 def _claude_project_dir_for_cwd(cwd):
     return CLAUDE_PROJECTS_DIR / str(Path(cwd).resolve()).replace("/", "-")
 
@@ -1729,6 +1798,16 @@ def refresh_once(force=False):
 # ─────────────────────────────────────────────
 
 if __name__ == '__main__':
+    if '--self-update' in sys.argv:
+        try:
+            idx = sys.argv.index('--self-update')
+            target = sys.argv[idx + 1]
+        except Exception:
+            print(json.dumps({"ok": False, "error": "Missing target version."}))
+            sys.exit(2)
+        result = SelfUpdater().update(target)
+        print(json.dumps(result, ensure_ascii=True))
+        sys.exit(0 if result.get("ok") else 1)
     if '--refresh-once' in sys.argv:
         refresh_once(force='--force' in sys.argv)
         sys.exit(0)

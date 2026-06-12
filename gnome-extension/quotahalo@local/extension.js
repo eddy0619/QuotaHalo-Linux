@@ -1216,6 +1216,7 @@ QuotaHaloUsageIndicator.prototype = {
         this._buttonPressId = 0;
         this._keyPressId = 0;
         this._refreshing = false;
+        this._selfUpdating = false;
         this._notifiedUpdateVersion = '';
         this._updateSource = null;
         this._lastUpdateDebugKey = '';
@@ -1404,10 +1405,13 @@ QuotaHaloUsageIndicator.prototype = {
         this._claudeSeparator = new PopupMenu.PopupSeparatorMenuItem();
         this.menu.addMenuItem(this._claudeSeparator);
 
-        this._updateItem = this._addMessageItem('');
-        addItemStyle(this._updateItem.item, 'quotahalo-update-item');
-        if (this._updateItem.label.add_style_class_name)
-            this._updateItem.label.add_style_class_name('quotahalo-update-label');
+        this._updateItem = this._addUpdateItem(function() {
+            var status = readStatus();
+            var update = status && status.update ? status.update : null;
+
+            if (updateAvailable(update))
+                self._requestSelfUpdate(update.latest_version);
+        });
 
         this._actionsControl = addUsageActionsControl(this.menu, function() {
             if (!self._refreshing) {
@@ -1593,7 +1597,7 @@ QuotaHaloUsageIndicator.prototype = {
             style_class: 'quotahalo-detail-value',
         });
         var bar = new St.DrawingArea({
-            width: 252,
+            width: 356,
             height: 11,
             x_expand: false,
             style_class: 'quotahalo-detail-progress',
@@ -1647,6 +1651,43 @@ QuotaHaloUsageIndicator.prototype = {
         item.add_child(label);
         this.menu.addMenuItem(item);
         return { item: item, label: label };
+    },
+
+    _addUpdateItem: function(callback) {
+        var item = new PopupMenu.PopupBaseMenuItem({
+            reactive: false,
+            can_focus: false,
+            style_class: 'quotahalo-update-item',
+        });
+        var row = new St.BoxLayout({
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: 'quotahalo-update-row',
+        });
+        var label = new St.Label({
+            text: '',
+            x_expand: true,
+            y_align: Clutter.ActorAlign.CENTER,
+            style_class: 'quotahalo-update-label',
+        });
+        var button = makeActionButton('Update', 'quotahalo-update-button');
+        var clickedId = 0;
+
+        setLabelEllipsize(label);
+        clickedId = button.connect('clicked', function() {
+            if (callback)
+                callback();
+        });
+        row.add_child(label);
+        row.add_child(button);
+        item.add_child(row);
+        this.menu.addMenuItem(item);
+        return {
+            item: item,
+            label: label,
+            button: button,
+            clickedId: clickedId,
+        };
     },
 
     _addMetaItem: function(key, value) {
@@ -1898,6 +1939,8 @@ QuotaHaloUsageIndicator.prototype = {
             return false;
         }
         this._updateItem.label.set_text(text);
+        setButtonLabel(this._updateItem.button, this._selfUpdating ? 'Updating' : 'Update');
+        setButtonEnabled(this._updateItem.button, !this._selfUpdating);
         setItemVisible(this._updateItem.item, true);
         return true;
     },
@@ -2179,6 +2222,63 @@ QuotaHaloUsageIndicator.prototype = {
         }
     },
 
+    _requestSelfUpdate: function(version) {
+        var self = this;
+        var proc;
+        var command;
+
+        version = String(version || '').trim();
+        if (!version || this._selfUpdating)
+            return;
+        command = [PYTHON_PATH, SCRIPT_PATH, '--self-update', version];
+        this._selfUpdating = true;
+        setButtonLabel(this._updateItem.button, 'Updating');
+        setButtonEnabled(this._updateItem.button, false);
+        try {
+            proc = Gio.Subprocess.new(
+                command,
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+            proc.communicate_utf8_async(null, null, function(subprocess, res) {
+                var stdout = '';
+                var stderr = '';
+                var ok = false;
+                var payload = null;
+                var message;
+
+                try {
+                    var result = subprocess.communicate_utf8_finish(res);
+                    ok = result[0] && subprocess.get_successful();
+                    stdout = result[1] || '';
+                    stderr = result[2] || '';
+                    try {
+                        payload = JSON.parse(stdout);
+                    } catch (parseError) {
+                        payload = null;
+                    }
+                    if (ok && payload && payload.ok) {
+                        message = payload.message || ('Updated to ' + version);
+                        Main.notify('QuotaHalo update complete', message);
+                    } else {
+                        message = (payload && payload.error) || stderr || stdout || 'Update failed';
+                        Main.notify('QuotaHalo update failed', message);
+                    }
+                } catch (e) {
+                    log('quotahalo self update failed: ' + e);
+                    Main.notify('QuotaHalo update failed', String(e));
+                }
+                self._selfUpdating = false;
+                setButtonLabel(self._updateItem.button, 'Update');
+                setButtonEnabled(self._updateItem.button, true);
+                self._update();
+            });
+        } catch (e) {
+            this._selfUpdating = false;
+            setButtonLabel(this._updateItem.button, 'Update');
+            setButtonEnabled(this._updateItem.button, true);
+            Main.notify('QuotaHalo update failed', String(e));
+        }
+    },
+
     _update: function(forceNotify) {
         var status = readStatus();
         var copilotStatus = readCopilotStatus();
@@ -2269,6 +2369,10 @@ QuotaHaloUsageIndicator.prototype = {
         if (this._startupRefreshTimeoutId) {
             GLib.Source.remove(this._startupRefreshTimeoutId);
             this._startupRefreshTimeoutId = 0;
+        }
+        if (this._updateItem && this._updateItem.clickedId) {
+            this._updateItem.button.disconnect(this._updateItem.clickedId);
+            this._updateItem.clickedId = 0;
         }
         if (this._updateSource) {
             this._updateSource.destroy();
@@ -2513,7 +2617,7 @@ QuotaHaloSystemIndicator.prototype = {
             style_class: 'quotahalo-detail-value',
         });
         var bar = new St.DrawingArea({
-            width: 252,
+            width: 356,
             height: 11,
             x_expand: false,
             style_class: 'quotahalo-detail-progress',

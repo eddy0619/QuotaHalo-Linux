@@ -19,11 +19,226 @@ STATUS_LABEL_FILE = STATUS_DIR / "usage-label.txt"
 STATUS_JSON_FILE = STATUS_DIR / "usage-status.json"
 CLAUDE_USAGE_CACHE_FILE = STATUS_DIR / "claude-usage-cache.json"
 CLAUDE_OAUTH_BACKOFF_FILE = STATUS_DIR / "claude-oauth-backoff.json"
+MANUAL_REFRESH_LOG_FILE = STATUS_DIR / "manual-refresh.log"
+MANUAL_REFRESH_LOG_MAX_BYTES = 1024 * 1024
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CLAUDE_USAGE_QUERY_TRASH_DIR = STATUS_DIR / "claude-usage-query-trash"
 CLAUDE_USAGE_REFRESH_SECONDS = 300
 CLAUDE_OAUTH_BACKOFF_SECONDS = 300
 USAGE_QUERY_PROMPTS = {"/usage", "usage"}
+
+
+class ManualRefreshDiagnostics:
+    MAX_FIELD_TEXT = 500
+    MAX_LIST_ITEMS = 3
+    LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+    _SENSITIVE_KEY_PATTERN = re.compile(
+        r"(token|authorization|password|secret|api[_-]?key|refresh[_-]?token|access[_-]?token|cookie)",
+        re.I,
+    )
+    _EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+    _BEARER_PATTERN = re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[A-Za-z0-9._~+/=-]+")
+    _OPENAI_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]+\b")
+    _JWT_PATTERN = re.compile(r"\b[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}\b")
+
+    def __init__(self, enabled=False, path=None, min_level=None):
+        self.enabled = bool(enabled)
+        self.path = Path(path or MANUAL_REFRESH_LOG_FILE)
+        self.min_level = self._normalize_level(
+            min_level or os.environ.get("QUOTAHALO_MANUAL_LOG_LEVEL") or "INFO"
+        )
+
+    def log(self, message, level="INFO", **fields):
+        if not self.enabled:
+            return
+        level = self._normalize_level(level)
+        if self.LEVELS[level] < self.LEVELS[self.min_level]:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._append_bounded(self._format_event(message, fields, level))
+        except Exception as e:
+            print(f"[QuotaHalo] Manual refresh log err: {e}", flush=True)
+
+    def exception(self, message, exc, level="ERROR", **fields):
+        fields = dict(fields)
+        fields["exception"] = f"{type(exc).__name__}: {exc}"
+        location = self._exception_location(exc)
+        if location:
+            fields["location"] = location
+        self.log(message, level=level, **fields)
+
+    def _append_bounded(self, text):
+        data = text.encode("utf-8", errors="replace")
+        limit = int(MANUAL_REFRESH_LOG_MAX_BYTES)
+        if limit <= 0:
+            return
+        if len(data) > limit:
+            data = self._trim_bytes(data, limit)
+        existing = b""
+        try:
+            if self.path.exists():
+                existing = self.path.read_bytes()
+        except Exception:
+            existing = b""
+        merged = existing + data
+        if len(merged) > limit:
+            marker = (
+                f"{self._timestamp()} WARN "
+                "manual refresh log reached 1 MB; older lines were discarded.\n"
+            ).encode("utf-8")
+            if len(marker) < limit:
+                merged = marker + self._trim_bytes(merged, limit - len(marker))
+            else:
+                merged = self._trim_bytes(merged, limit)
+        self.path.write_bytes(merged)
+
+    @staticmethod
+    def _trim_bytes(data, limit):
+        text = data[-limit:].decode("utf-8", errors="ignore")
+        if text and not re.match(
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (DEBUG|INFO|WARN|ERROR) ",
+            text,
+        ):
+            newline = text.find("\n")
+            text = text[newline + 1:] if newline >= 0 else ""
+        return text.encode("utf-8")
+
+    def _format_event(self, message, fields, level):
+        prefix = f"{self._timestamp()} {level} "
+        lines = [f"{prefix}{self._sentence(message)}"]
+        for key in sorted(fields):
+            for sentence in self._field_sentences(str(key), fields[key]):
+                lines.append(f"{prefix}{sentence}")
+        return "\n".join(lines) + "\n"
+
+    def _field_sentences(self, key, value):
+        label = self._human_key(key)
+        if self._is_sensitive_key(key):
+            return [f"{label} is [REDACTED]."]
+        value = self._safe_value(value)
+        if isinstance(value, dict):
+            if not value:
+                return [f"{label} is empty."]
+            lines = []
+            for child_key in sorted(value):
+                lines.extend(self._field_sentences(f"{label} {child_key}", value[child_key]))
+            return lines
+        if isinstance(value, list):
+            if not value:
+                return [f"{label} is empty."]
+            lines = []
+            shown = value[:self.MAX_LIST_ITEMS]
+            for index, item in enumerate(shown, start=1):
+                if isinstance(item, dict):
+                    for child in sorted(item):
+                        lines.extend(
+                            self._field_sentences(
+                                f"{label} item {index} {child}",
+                                item[child],
+                            )
+                        )
+                else:
+                    lines.append(f"{label} item {index} is {self._stringify(item)}.")
+            hidden = len(value) - len(shown)
+            if hidden > 0:
+                lines.append(f"{label} has {hidden} more item(s) not shown.")
+            return lines
+        if isinstance(value, str) and "\n" in value:
+            lines = []
+            parts = value.splitlines()
+            shown = parts[:12]
+            for index, part in enumerate(shown, start=1):
+                lines.append(f"{label} line {index} is {self._stringify(part)}.")
+            hidden = len(parts) - len(shown)
+            if hidden > 0:
+                lines.append(f"{label} has {hidden} more line(s) not shown.")
+            return lines
+        return [f"{label} is {self._stringify(value)}."]
+
+    @staticmethod
+    def _safe_value(value):
+        if isinstance(value, Path):
+            return ManualRefreshDiagnostics._redact_text(str(value))
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            if isinstance(value, str):
+                return ManualRefreshDiagnostics._redact_text(value)
+            return value
+        if isinstance(value, (list, tuple)):
+            return [ManualRefreshDiagnostics._safe_value(v) for v in value]
+        if isinstance(value, dict):
+            return {
+                str(k): (
+                    "[REDACTED]"
+                    if ManualRefreshDiagnostics._is_sensitive_key(str(k))
+                    else ManualRefreshDiagnostics._safe_value(v)
+                )
+                for k, v in value.items()
+            }
+        return ManualRefreshDiagnostics._redact_text(str(value))
+
+    @staticmethod
+    def _is_sensitive_key(key):
+        return bool(ManualRefreshDiagnostics._SENSITIVE_KEY_PATTERN.search(str(key)))
+
+    @staticmethod
+    def _human_key(key):
+        text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(key))
+        text = re.sub(r"[_\-.]+", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip().lower()
+
+    @staticmethod
+    def _redact_text(text):
+        text = str(text)
+        home = str(Path.home())
+        if home and home != "/":
+            text = text.replace(home, "~")
+        text = ManualRefreshDiagnostics._BEARER_PATTERN.sub(r"\1[REDACTED]", text)
+        text = ManualRefreshDiagnostics._OPENAI_KEY_PATTERN.sub("[REDACTED]", text)
+        text = ManualRefreshDiagnostics._JWT_PATTERN.sub("[REDACTED]", text)
+        text = ManualRefreshDiagnostics._EMAIL_PATTERN.sub("[REDACTED_EMAIL]", text)
+        return text
+
+    @staticmethod
+    def _stringify(value):
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "yes" if value else "no"
+        text = ManualRefreshDiagnostics._redact_text(str(value))
+        if len(text) > ManualRefreshDiagnostics.MAX_FIELD_TEXT:
+            text = text[: ManualRefreshDiagnostics.MAX_FIELD_TEXT - 3] + "..."
+        return text
+
+    @classmethod
+    def _sentence(cls, value):
+        text = cls._stringify(value).strip()
+        if not text:
+            return "event."
+        if text[-1] not in ".!?":
+            text += "."
+        return text
+
+    @classmethod
+    def _normalize_level(cls, level):
+        level = str(level or "INFO").upper()
+        return level if level in cls.LEVELS else "INFO"
+
+    @staticmethod
+    def _timestamp():
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _exception_location(exc):
+        tb = exc.__traceback__
+        if not tb:
+            return ""
+        while tb.tb_next:
+            tb = tb.tb_next
+        frame = tb.tb_frame
+        filename = ManualRefreshDiagnostics._redact_text(frame.f_code.co_filename)
+        return f"{filename}:{tb.tb_lineno} in {frame.f_code.co_name}"
 
 
 def _claude_project_dir_for_cwd(cwd):
@@ -806,25 +1021,40 @@ class CodexDataFetcher:
             "error": None, "available": False,
         }
 
-    def fetch(self):
+    def fetch(self, diagnostics=None):
         d = self._empty()
+        if diagnostics:
+            diagnostics.log(
+                "Codex fetch started",
+                codex_dir=self.CODEX_DIR,
+                codex_dir_exists=self.CODEX_DIR.exists(),
+            )
         if not self.CODEX_DIR.exists():
             d["error"] = "Codex not installed"
+            if diagnostics:
+                diagnostics.log("Codex fetch skipped", level="WARN", reason=d["error"])
             return d
         d["available"] = True
 
         try:
             config = self.CODEX_DIR / "config.toml"
+            if diagnostics:
+                diagnostics.log("Codex config checked", level="DEBUG", path=config, exists=config.exists())
             if config.exists():
                 for line in config.read_text().splitlines():
                     if line.startswith("model"):
                         d["model"] = line.split("=", 1)[1].strip().strip('"')
                         break
-        except Exception:
-            pass
+            if diagnostics:
+                diagnostics.log("Codex model detected", level="DEBUG", model=bool(d["model"]))
+        except Exception as e:
+            if diagnostics:
+                diagnostics.exception("Codex config read failed", e, level="WARN", path=self.CODEX_DIR / "config.toml")
 
         try:
             auth = self.CODEX_DIR / "auth.json"
+            if diagnostics:
+                diagnostics.log("Codex auth checked", level="DEBUG", path=auth, exists=auth.exists())
             if auth.exists():
                 aj = json.loads(auth.read_text(encoding="utf-8"))
                 tokens = aj.get("tokens", {})
@@ -838,34 +1068,94 @@ class CodexDataFetcher:
                             "chatgpt_plan_type", "")
                         if plan:
                             d["plan"] = plan.capitalize()
-        except Exception:
-            pass
+            if diagnostics:
+                diagnostics.log("Codex plan detected", level="DEBUG", plan=d["plan"])
+        except Exception as e:
+            if diagnostics:
+                diagnostics.exception("Codex auth read failed", e, level="WARN", path=self.CODEX_DIR / "auth.json")
 
-        self._scan_sessions(d)
+        self._scan_sessions(d, diagnostics=diagnostics)
+        if diagnostics:
+            diagnostics.log(
+                "Codex fetch finished",
+                source=d.get("source"),
+                available=d.get("available"),
+                session_used_pct=d.get("session_used_pct"),
+                weekly_used_pct=d.get("weekly_used_pct"),
+                session_reset=d.get("session_reset"),
+                weekly_reset=d.get("weekly_reset"),
+                updated=d.get("updated"),
+                error=d.get("error"),
+            )
         return d
 
-    def _scan_sessions(self, d):
+    def _scan_sessions(self, d, diagnostics=None):
         sessions_dir = self.CODEX_DIR / "sessions"
         if not sessions_dir.exists():
             d["source"] = "config"
+            if diagnostics:
+                diagnostics.log("Codex session scan skipped", level="WARN", reason="sessions directory missing", path=sessions_dir)
             return
 
+        stat_errors = []
+
+        def file_mtime(path):
+            try:
+                return path.stat().st_mtime
+            except OSError as e:
+                stat_errors.append((path, e))
+                return 0
+
         jsonl_files = sorted(sessions_dir.rglob("*.jsonl"),
-                             key=lambda f: f.stat().st_mtime, reverse=True)
+                             key=file_mtime, reverse=True)
         if not jsonl_files:
             d["source"] = "config"
+            if diagnostics:
+                diagnostics.log("Codex session scan skipped", level="WARN", reason="no session jsonl files", path=sessions_dir)
             return
 
         print(f"    Codex: scanning {len(jsonl_files)} session files")
+        if diagnostics:
+            recent_files = []
+            for path in jsonl_files[:3]:
+                try:
+                    stat = path.stat()
+                    recent_files.append({
+                        "path": path,
+                        "size": stat.st_size,
+                        "mtime": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
+                    })
+                except OSError as e:
+                    stat_errors.append((path, e))
+            diagnostics.log(
+                "Codex session scan started",
+                sessions_dir=sessions_dir,
+                session_files=len(jsonl_files),
+                recent_files=recent_files,
+                stat_errors=len(stat_errors),
+            )
+            for path, err in stat_errors[:5]:
+                diagnostics.exception("Codex session file stat failed", err, level="WARN", path=path)
 
         latest_limits = None
         latest_limits_updated = None
+        checked_files = 0
         for jf in jsonl_files:
-            rate_limits = self._extract_rate_limits(jf)
+            checked_files += 1
+            rate_limits = self._extract_rate_limits(jf, diagnostics=diagnostics)
             if rate_limits:
                 limits, updated, _sort_key = rate_limits
                 latest_limits = limits
                 latest_limits_updated = updated
+                if diagnostics:
+                    diagnostics.log(
+                        "Codex rate limits selected",
+                        path=jf,
+                        checked_files=checked_files,
+                        updated=updated,
+                        has_primary=bool(limits.get("primary")),
+                        has_secondary=bool(limits.get("secondary")),
+                    )
                 break
 
         if latest_limits:
@@ -884,6 +1174,13 @@ class CodexDataFetcher:
             d["source"] = "sessions"
         else:
             d["source"] = "config"
+            if diagnostics:
+                diagnostics.log(
+                    "Codex rate limits missing",
+                    level="WARN",
+                    checked_files=checked_files,
+                    session_files=len(jsonl_files),
+                )
 
         total_in = total_out = today_in = today_out = 0
         today = datetime.now().date()
@@ -904,7 +1201,9 @@ class CodexDataFetcher:
                         today_out += out
                 except Exception:
                     pass
-            except Exception:
+            except Exception as e:
+                if diagnostics:
+                    diagnostics.exception("Codex token total extraction failed", e, level="WARN", path=jf)
                 continue
 
         c30 = (total_in * 2.5 + total_out * 10) / 1e6
@@ -921,22 +1220,29 @@ class CodexDataFetcher:
         d["cost_30d_tokens"] = fmt(total_in + total_out)
 
     @staticmethod
-    def _extract_rate_limits(jsonl_path):
+    def _extract_rate_limits(jsonl_path, diagnostics=None):
         best = None
         best_updated = None
         best_sort_key = -1
+        matching_lines = 0
+        token_count_events = 0
+        rate_limit_events = 0
+        invalid_lines = 0
         try:
             with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line or "rate_limits" not in line:
                         continue
+                    matching_lines += 1
                     try:
                         e = json.loads(line)
                         p = e.get("payload", {})
                         if isinstance(p, dict) and p.get("type") == "token_count":
+                            token_count_events += 1
                             rl = p.get("rate_limits")
                             if rl:
+                                rate_limit_events += 1
                                 updated, sort_key = CodexDataFetcher._format_event_time(
                                     e.get("timestamp"), jsonl_path)
                                 if sort_key > best_sort_key:
@@ -944,9 +1250,22 @@ class CodexDataFetcher:
                                     best_updated = updated
                                     best_sort_key = sort_key
                     except Exception:
-                        pass
-        except Exception:
-            pass
+                        invalid_lines += 1
+        except Exception as e:
+            if diagnostics:
+                diagnostics.exception("Codex rate limit file read failed", e, level="WARN", path=jsonl_path)
+        if diagnostics and (matching_lines or invalid_lines or best):
+            diagnostics.log(
+                "Codex rate limit file scanned",
+                level="DEBUG",
+                path=jsonl_path,
+                matching_lines=matching_lines,
+                token_count_events=token_count_events,
+                rate_limit_events=rate_limit_events,
+                invalid_lines=invalid_lines,
+                found=bool(best),
+                updated=best_updated,
+            )
         if not best:
             return None
         return best, best_updated, best_sort_key
@@ -1136,7 +1455,7 @@ def _panel_status_payload(claude, codex):
     }
 
 
-def _write_panel_status(claude, codex):
+def _write_panel_status(claude, codex, diagnostics=None):
     try:
         STATUS_DIR.mkdir(parents=True, exist_ok=True)
         payload = _panel_status_payload(claude, codex)
@@ -1151,27 +1470,58 @@ def _write_panel_status(claude, codex):
             encoding="utf-8",
         )
         json_tmp.replace(STATUS_JSON_FILE)
+        if diagnostics:
+            diagnostics.log(
+                "Panel status written",
+                level="DEBUG",
+                label=payload.get("label"),
+                status_path=STATUS_JSON_FILE,
+                providers=list((payload.get("providers") or {}).keys()),
+            )
     except Exception as e:
         print(f"[QuotaHalo] Status write err: {e}", flush=True)
+        if diagnostics:
+            diagnostics.exception("Panel status write failed", e, status_path=STATUS_JSON_FILE)
 
 
 def refresh_once(force=False):
+    diagnostics = ManualRefreshDiagnostics(enabled=force)
+    diagnostics.log(
+        "manual refresh started",
+        force=force,
+        python=sys.executable,
+        cwd=Path.cwd(),
+        status_dir=STATUS_DIR,
+        script=Path(__file__).resolve(),
+    )
     claude_fetcher = ClaudeDataFetcher()
     codex_fetcher = CodexDataFetcher()
 
     try:
         claude_data = claude_fetcher.fetch_all(force=force)
+        diagnostics.log(
+            "Claude refresh finished",
+            source=claude_data.get("source"),
+            installed=claude_data.get("installed"),
+            session_used_pct=claude_data.get("session_used_pct"),
+            weekly_used_pct=claude_data.get("weekly_used_pct"),
+            updated=claude_data.get("updated"),
+            error=claude_data.get("error"),
+        )
     except Exception as e:
         print(f"[QuotaHalo] Claude refresh err: {e}", flush=True)
+        diagnostics.exception("Claude refresh failed", e)
         claude_data = claude_fetcher.data
 
     try:
-        codex_data = codex_fetcher.fetch()
+        codex_data = codex_fetcher.fetch(diagnostics=diagnostics)
     except Exception as e:
         print(f"[QuotaHalo] Codex refresh err: {e}", flush=True)
+        diagnostics.exception("Codex refresh failed", e)
         codex_data = CodexDataFetcher._empty()
 
-    _write_panel_status(claude_data, codex_data)
+    _write_panel_status(claude_data, codex_data, diagnostics=diagnostics)
+    diagnostics.log("manual refresh finished")
     print("[QuotaHalo] Refreshed once", flush=True)
 
 

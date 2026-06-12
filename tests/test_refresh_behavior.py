@@ -165,6 +165,185 @@ class RefreshBehaviorTests(unittest.TestCase):
         body = match.group("body")
         self.assertNotIn("PopupBaseMenuItem({ reactive: false })", body)
 
+    def test_force_refresh_writes_diagnostic_log_with_exception_details(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status_dir = Path(tmp) / "quotahalo"
+            log_path = status_dir / "manual-refresh.log"
+            claude_empty = qhs.ClaudeDataFetcher()._empty
+            codex_empty = qhs.CodexDataFetcher._empty
+
+            class ClaudeFetcher:
+                def __init__(self):
+                    self.data = claude_empty()
+
+                def fetch_all(self, force=False):
+                    return self.data
+
+            class CodexFetcher:
+                @staticmethod
+                def _empty():
+                    return codex_empty()
+
+                def fetch(self, diagnostics=None):
+                    raise RuntimeError("codex boom")
+
+            original_status_dir = qhs.STATUS_DIR
+            original_label_file = qhs.STATUS_LABEL_FILE
+            original_json_file = qhs.STATUS_JSON_FILE
+            original_log_file = getattr(qhs, "MANUAL_REFRESH_LOG_FILE", None)
+            original_claude_fetcher = qhs.ClaudeDataFetcher
+            original_codex_fetcher = qhs.CodexDataFetcher
+            qhs.STATUS_DIR = status_dir
+            qhs.STATUS_LABEL_FILE = status_dir / "usage-label.txt"
+            qhs.STATUS_JSON_FILE = status_dir / "usage-status.json"
+            qhs.MANUAL_REFRESH_LOG_FILE = log_path
+            qhs.ClaudeDataFetcher = ClaudeFetcher
+            qhs.CodexDataFetcher = CodexFetcher
+            try:
+                qhs.refresh_once(force=True)
+            finally:
+                qhs.STATUS_DIR = original_status_dir
+                qhs.STATUS_LABEL_FILE = original_label_file
+                qhs.STATUS_JSON_FILE = original_json_file
+                qhs.MANUAL_REFRESH_LOG_FILE = original_log_file
+                qhs.ClaudeDataFetcher = original_claude_fetcher
+                qhs.CodexDataFetcher = original_codex_fetcher
+
+            text = log_path.read_text(encoding="utf-8")
+            self.assertIn("manual refresh started", text)
+            self.assertIn("Codex refresh failed", text)
+            self.assertIn("RuntimeError: codex boom", text)
+            self.assertIn("ERROR", text)
+            self.assertNotIn("traceback", text.lower())
+
+    def test_background_refresh_does_not_write_manual_diagnostic_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status_dir = Path(tmp) / "quotahalo"
+            log_path = status_dir / "manual-refresh.log"
+            claude_empty = qhs.ClaudeDataFetcher()._empty
+            codex_empty = qhs.CodexDataFetcher._empty
+
+            class ClaudeFetcher:
+                def __init__(self):
+                    self.data = claude_empty()
+
+                def fetch_all(self, force=False):
+                    return self.data
+
+            class CodexFetcher:
+                @staticmethod
+                def _empty():
+                    return codex_empty()
+
+                def fetch(self, diagnostics=None):
+                    raise RuntimeError("background boom")
+
+            original_status_dir = qhs.STATUS_DIR
+            original_label_file = qhs.STATUS_LABEL_FILE
+            original_json_file = qhs.STATUS_JSON_FILE
+            original_log_file = getattr(qhs, "MANUAL_REFRESH_LOG_FILE", None)
+            original_claude_fetcher = qhs.ClaudeDataFetcher
+            original_codex_fetcher = qhs.CodexDataFetcher
+            qhs.STATUS_DIR = status_dir
+            qhs.STATUS_LABEL_FILE = status_dir / "usage-label.txt"
+            qhs.STATUS_JSON_FILE = status_dir / "usage-status.json"
+            qhs.MANUAL_REFRESH_LOG_FILE = log_path
+            qhs.ClaudeDataFetcher = ClaudeFetcher
+            qhs.CodexDataFetcher = CodexFetcher
+            try:
+                qhs.refresh_once(force=False)
+            finally:
+                qhs.STATUS_DIR = original_status_dir
+                qhs.STATUS_LABEL_FILE = original_label_file
+                qhs.STATUS_JSON_FILE = original_json_file
+                qhs.MANUAL_REFRESH_LOG_FILE = original_log_file
+                qhs.ClaudeDataFetcher = original_claude_fetcher
+                qhs.CodexDataFetcher = original_codex_fetcher
+
+            self.assertFalse(log_path.exists())
+
+    def test_manual_refresh_log_is_capped_without_rotated_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "manual-refresh.log"
+            original_limit = qhs.MANUAL_REFRESH_LOG_MAX_BYTES
+            qhs.MANUAL_REFRESH_LOG_MAX_BYTES = 220
+            try:
+                diagnostics = qhs.ManualRefreshDiagnostics(enabled=True, path=log_path)
+                for i in range(20):
+                    diagnostics.log("cap test", index=i, payload="x" * 80)
+            finally:
+                qhs.MANUAL_REFRESH_LOG_MAX_BYTES = original_limit
+
+            self.assertLessEqual(log_path.stat().st_size, 220)
+            self.assertFalse(log_path.with_name("manual-refresh.log.1").exists())
+
+    def test_manual_refresh_log_redacts_private_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "manual-refresh.log"
+            diagnostics = qhs.ManualRefreshDiagnostics(enabled=True, path=log_path)
+            diagnostics.log(
+                "privacy test",
+                path=Path.home() / ".codex" / "auth.json",
+                email="person@example.com",
+                access_token="sk-secret-token",
+                nested={"refreshToken": "refresh-secret"},
+                note="Authorization: Bearer abc.def.ghi",
+            )
+
+            text = log_path.read_text(encoding="utf-8")
+            self.assertIn("privacy test", text)
+            self.assertIn("path is", text)
+            self.assertIn("~/.codex/auth.json", text)
+            self.assertNotIn(str(Path.home()), text)
+            self.assertNotIn("person@example.com", text)
+            self.assertNotIn("sk-secret-token", text)
+            self.assertNotIn("refresh-secret", text)
+            self.assertNotIn("abc.def.ghi", text)
+            self.assertIn("[REDACTED]", text)
+
+    def test_manual_refresh_log_uses_timestamped_plain_language_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "manual-refresh.log"
+            diagnostics = qhs.ManualRefreshDiagnostics(enabled=True, path=log_path)
+            diagnostics.log(
+                "Codex session scan started",
+                codex_dir=Path.home() / ".codex",
+                session_files=3,
+                recent_files=[
+                    {
+                        "path": Path.home() / ".codex" / "sessions" / "one.jsonl",
+                        "size": 123,
+                    }
+                ],
+            )
+
+            lines = [
+                line for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertGreaterEqual(len(lines), 2)
+            for line in lines:
+                self.assertRegex(line, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (INFO|WARN|ERROR) ")
+                self.assertNotIn("===", line)
+                self.assertNotIn("{", line)
+                self.assertNotIn("}", line)
+                self.assertNotIn("T", line[:20])
+                self.assertFalse(line.startswith(" "))
+            self.assertIn("Codex session scan started.", lines[0])
+            self.assertTrue(any("session files is 3" in line for line in lines))
+            self.assertTrue(any("recent files item 1 path is" in line for line in lines))
+
+    def test_manual_refresh_log_suppresses_debug_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "manual-refresh.log"
+            diagnostics = qhs.ManualRefreshDiagnostics(enabled=True, path=log_path)
+            diagnostics.log("visible info")
+            diagnostics.log("hidden debug", level="DEBUG")
+
+            text = log_path.read_text(encoding="utf-8")
+            self.assertIn("INFO visible info.", text)
+            self.assertNotIn("hidden debug", text)
+
 
 if __name__ == "__main__":
     unittest.main()

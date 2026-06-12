@@ -409,6 +409,30 @@ class RefreshBehaviorTests(unittest.TestCase):
             self.assertEqual(status["latest_version"], "v0.1.0")
             self.assertFalse(status["update_available"])
 
+    def test_release_version_does_not_prompt_when_latest_tag_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "update-status.json"
+
+            def fetch_json(url):
+                if url.endswith("/tags"):
+                    return [{"name": "v0.2.0"}, {"name": "v0.1.0"}]
+                raise AssertionError(f"unexpected url: {url}")
+
+            current = qhs._read_current_version()
+            checker = qhs.VersionChecker(
+                current_version=current,
+                repo="owner/repo",
+                cache_path=cache_path,
+                fetch_json=fetch_json,
+                now=lambda: 1000.0,
+            )
+            status = checker.check(force=True)
+
+            self.assertEqual(current, "v0.2.0")
+            self.assertEqual(status["latest_version"], "v0.2.0")
+            self.assertFalse(status["update_available"])
+            self.assertEqual(status["changelog"], [])
+
     def test_panel_status_payload_includes_update_status(self):
         update_status = {
             "current_version": "v0.1.0",

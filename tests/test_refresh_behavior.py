@@ -344,6 +344,128 @@ class RefreshBehaviorTests(unittest.TestCase):
             self.assertIn("INFO visible info.", text)
             self.assertNotIn("hidden debug", text)
 
+    def test_version_checker_detects_newer_tag_and_changelog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "update-status.json"
+            calls = []
+
+            def fetch_json(url):
+                calls.append(url)
+                if url.endswith("/tags"):
+                    return [
+                        {"name": "v0.1.0"},
+                        {"name": "v0.2.0"},
+                    ]
+                if "/compare/v0.1.0...v0.2.0" in url:
+                    return {
+                        "commits": [
+                            {"commit": {"message": "Add version check\n\nDetails"}},
+                            {"commit": {"message": "Improve update UI"}},
+                        ]
+                    }
+                raise AssertionError(f"unexpected url: {url}")
+
+            checker = qhs.VersionChecker(
+                current_version="v0.1.0",
+                repo="owner/repo",
+                cache_path=cache_path,
+                fetch_json=fetch_json,
+                now=lambda: 1000.0,
+            )
+            status = checker.check(force=True)
+
+            self.assertEqual(status["current_version"], "v0.1.0")
+            self.assertEqual(status["latest_version"], "v0.2.0")
+            self.assertTrue(status["update_available"])
+            self.assertEqual(status["changelog"], ["Add version check", "Improve update UI"])
+            self.assertEqual(status["release_url"], "https://github.com/owner/repo/releases/tag/v0.2.0")
+            self.assertEqual(len(calls), 2)
+
+    def test_version_checker_uses_daily_cache_without_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "update-status.json"
+            cached = {
+                "current_version": "v0.1.0",
+                "latest_version": "v0.1.0",
+                "update_available": False,
+                "checked_at_epoch": 1000.0,
+                "checked_at": "1970-01-01 00:16:40",
+            }
+            cache_path.write_text(json.dumps(cached), encoding="utf-8")
+
+            def fetch_json(url):
+                raise AssertionError("network should not be called when cache is fresh")
+
+            checker = qhs.VersionChecker(
+                current_version="v0.1.0",
+                repo="owner/repo",
+                cache_path=cache_path,
+                fetch_json=fetch_json,
+                now=lambda: 1000.0 + 3600.0,
+            )
+            status = checker.check(force=False)
+
+            self.assertEqual(status["latest_version"], "v0.1.0")
+            self.assertFalse(status["update_available"])
+
+    def test_panel_status_payload_includes_update_status(self):
+        update_status = {
+            "current_version": "v0.1.0",
+            "latest_version": "v0.2.0",
+            "update_available": True,
+        }
+        payload = qhs._panel_status_payload(
+            qhs.ClaudeDataFetcher()._empty(),
+            qhs.CodexDataFetcher._empty(),
+            update_status,
+        )
+
+        self.assertEqual(payload["update"]["latest_version"], "v0.2.0")
+        self.assertTrue(payload["update"]["update_available"])
+
+    def test_extension_has_update_reminder_and_dismiss_action(self):
+        extension_path = (
+            Path(__file__).resolve().parents[1]
+            / "gnome-extension"
+            / "quotahalo@local"
+            / "extension.js"
+        )
+        text = extension_path.read_text(encoding="utf-8")
+
+        self.assertIn("imports.ui.messageTray", text)
+        self.assertIn("UPDATE_DISMISSED_PATH", text)
+        self.assertIn("_setUpdateDetails", text)
+        self.assertIn("_maybeNotifyUpdate", text)
+        self.assertIn("Do not remind", text)
+        self.assertIn("writeDismissedUpdateVersion", text)
+        self.assertIn("extension-update-debug.json", text)
+        self.assertIn("self._update(manual);", text)
+        self.assertIn("_maybeNotifyUpdate(status.update, !!forceNotify)", text)
+        self.assertIn("showCopilot || showCodex || showClaude || showUpdate", text)
+        self.assertIn("setItemVisible(this._updateItem.item, showUpdate)", text)
+
+    def test_extension_keeps_detail_width_stable_for_long_messages(self):
+        root = Path(__file__).resolve().parents[1]
+        extension_text = (
+            root / "gnome-extension" / "quotahalo@local" / "extension.js"
+        ).read_text(encoding="utf-8")
+        stylesheet_text = (
+            root / "gnome-extension" / "quotahalo@local" / "stylesheet.css"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("var Pango = imports.gi.Pango;", extension_text)
+        self.assertIn("setLabelEllipsize", extension_text)
+        self.assertIn("return 'Update available: ' + latest;", extension_text)
+        self.assertIn("details sent as notification", extension_text)
+        self.assertIn("_notifyProviderError('Copilot', status)", extension_text)
+        self.assertIn("_notifyProviderError('Codex', status)", extension_text)
+        self.assertIn("_notifyProviderError('Claude', claude)", extension_text)
+        self.assertNotIn("'Usage unavailable  ·  ' + error", extension_text)
+        self.assertNotIn("changelog.replace", extension_text)
+        self.assertNotIn("current ' + current", extension_text)
+        self.assertIn("width: 316px;", stylesheet_text)
+        self.assertIn("max-width: 316px;", stylesheet_text)
+
 
 if __name__ == "__main__":
     unittest.main()

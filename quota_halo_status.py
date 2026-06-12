@@ -21,6 +21,12 @@ CLAUDE_USAGE_CACHE_FILE = STATUS_DIR / "claude-usage-cache.json"
 CLAUDE_OAUTH_BACKOFF_FILE = STATUS_DIR / "claude-oauth-backoff.json"
 MANUAL_REFRESH_LOG_FILE = STATUS_DIR / "manual-refresh.log"
 MANUAL_REFRESH_LOG_MAX_BYTES = 1024 * 1024
+UPDATE_STATUS_FILE = STATUS_DIR / "update-status.json"
+PROJECT_DIR = Path(__file__).resolve().parent
+VERSION_FILE = PROJECT_DIR / "VERSION"
+GITHUB_REPO = os.environ.get("QUOTAHALO_GITHUB_REPO", "eddy0619/QuotaHalo-Linux")
+GITHUB_API_BASE = "https://api.github.com"
+UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CLAUDE_USAGE_QUERY_TRASH_DIR = STATUS_DIR / "claude-usage-query-trash"
 CLAUDE_USAGE_REFRESH_SECONDS = 300
@@ -239,6 +245,197 @@ class ManualRefreshDiagnostics:
         frame = tb.tb_frame
         filename = ManualRefreshDiagnostics._redact_text(frame.f_code.co_filename)
         return f"{filename}:{tb.tb_lineno} in {frame.f_code.co_name}"
+
+
+def _read_current_version():
+    try:
+        text = VERSION_FILE.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    except Exception:
+        pass
+    return "v0.1.0"
+
+
+def _version_key(version):
+    text = str(version or "").strip()
+    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$", text)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _version_newer(left, right):
+    left_key = _version_key(left)
+    right_key = _version_key(right)
+    if left_key is None or right_key is None:
+        return False
+    return left_key > right_key
+
+
+def _github_fetch_json(url):
+    req = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"QuotaHalo/{_read_current_version()}",
+        },
+    )
+    with urlopen(req, timeout=8) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+class VersionChecker:
+    def __init__(
+        self,
+        current_version=None,
+        repo=None,
+        cache_path=None,
+        fetch_json=None,
+        now=None,
+    ):
+        self.current_version = current_version or _read_current_version()
+        self.repo = repo or GITHUB_REPO
+        self.cache_path = Path(cache_path or UPDATE_STATUS_FILE)
+        self.fetch_json = fetch_json or _github_fetch_json
+        self.now = now or time.time
+
+    def check(self, force=False, diagnostics=None):
+        cached = self._read_cache()
+        now_epoch = float(self.now())
+        if not force and self._cache_fresh(cached, now_epoch):
+            return cached
+
+        try:
+            status = self._fetch(now_epoch)
+            self._write_cache(status)
+            if diagnostics:
+                diagnostics.log(
+                    "Version check finished",
+                    latest_version=status.get("latest_version"),
+                    update_available=status.get("update_available"),
+                )
+            return status
+        except Exception as e:
+            if diagnostics:
+                diagnostics.exception("Version check failed", e, level="WARN")
+            status = cached or self._empty(now_epoch)
+            status.update({
+                "checked_at_epoch": now_epoch,
+                "checked_at": self._format_time(now_epoch),
+                "error": str(e),
+            })
+            self._write_cache(status)
+            return status
+
+    def _fetch(self, now_epoch):
+        tags = self.fetch_json(self._tags_url())
+        tag_names = [
+            item.get("name")
+            for item in tags
+            if isinstance(item, dict) and _version_key(item.get("name")) is not None
+        ]
+        latest = self._latest_tag(tag_names)
+        current = self.current_version
+        update_available = bool(latest and _version_newer(latest, current))
+        changelog = []
+        compare_url = ""
+        if update_available:
+            compare_url = self._compare_url(current, latest)
+            changelog = self._fetch_changelog(compare_url)
+
+        return {
+            "provider": "QuotaHalo",
+            "current_version": current,
+            "latest_version": latest or current,
+            "update_available": update_available,
+            "checked_at_epoch": now_epoch,
+            "checked_at": self._format_time(now_epoch),
+            "release_url": self._release_url(latest) if latest else "",
+            "compare_url": compare_url,
+            "changelog": changelog,
+            "error": None,
+        }
+
+    def _fetch_changelog(self, compare_url):
+        try:
+            data = self.fetch_json(compare_url)
+        except Exception:
+            return []
+        commits = data.get("commits") if isinstance(data, dict) else []
+        messages = []
+        for item in commits or []:
+            commit = item.get("commit") if isinstance(item, dict) else {}
+            message = commit.get("message") if isinstance(commit, dict) else ""
+            first_line = str(message or "").splitlines()[0].strip()
+            if first_line:
+                messages.append(first_line)
+            if len(messages) >= 8:
+                break
+        return messages
+
+    def _cache_fresh(self, cached, now_epoch):
+        if not cached:
+            return False
+        if cached.get("current_version") != self.current_version:
+            return False
+        try:
+            checked = float(cached.get("checked_at_epoch") or 0)
+        except Exception:
+            checked = 0
+        return checked > 0 and now_epoch - checked < UPDATE_CHECK_INTERVAL_SECONDS
+
+    def _read_cache(self):
+        try:
+            raw = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return raw
+        except Exception:
+            pass
+        return None
+
+    def _write_cache(self, status):
+        try:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.cache_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(status, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
+            tmp.replace(self.cache_path)
+        except Exception:
+            pass
+
+    def _empty(self, now_epoch):
+        return {
+            "provider": "QuotaHalo",
+            "current_version": self.current_version,
+            "latest_version": self.current_version,
+            "update_available": False,
+            "checked_at_epoch": now_epoch,
+            "checked_at": self._format_time(now_epoch),
+            "release_url": "",
+            "compare_url": "",
+            "changelog": [],
+            "error": None,
+        }
+
+    @staticmethod
+    def _latest_tag(tags):
+        valid = [tag for tag in tags if _version_key(tag) is not None]
+        if not valid:
+            return ""
+        return sorted(valid, key=_version_key)[-1]
+
+    def _tags_url(self):
+        return f"{GITHUB_API_BASE}/repos/{self.repo}/tags"
+
+    def _compare_url(self, current, latest):
+        return f"{GITHUB_API_BASE}/repos/{self.repo}/compare/{current}...{latest}"
+
+    def _release_url(self, tag):
+        return f"https://github.com/{self.repo}/releases/tag/{tag}"
+
+    @staticmethod
+    def _format_time(epoch):
+        return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _claude_project_dir_for_cwd(cwd):
@@ -1404,7 +1601,8 @@ def _has_claude_quota(data):
     return data.get("session_used_pct") is not None
 
 
-def _panel_status_payload(claude, codex):
+def _panel_status_payload(claude, codex, update_status=None):
+    update_status = update_status or VersionChecker()._empty(time.time())
     return {
         "label": _provider_label(codex),
         "title": _provider_title(codex),
@@ -1452,13 +1650,14 @@ def _panel_status_payload(claude, codex):
             "cost_30d_tokens": claude.get("cost_30d_tokens", "0"),
             "cost_window": "30d",
         },
+        "update": update_status,
     }
 
 
-def _write_panel_status(claude, codex, diagnostics=None):
+def _write_panel_status(claude, codex, update_status=None, diagnostics=None):
     try:
         STATUS_DIR.mkdir(parents=True, exist_ok=True)
-        payload = _panel_status_payload(claude, codex)
+        payload = _panel_status_payload(claude, codex, update_status)
 
         label_tmp = STATUS_LABEL_FILE.with_suffix(".txt.tmp")
         label_tmp.write_text(payload["label"] + "\n", encoding="utf-8")
@@ -1520,7 +1719,9 @@ def refresh_once(force=False):
         diagnostics.exception("Codex refresh failed", e)
         codex_data = CodexDataFetcher._empty()
 
-    _write_panel_status(claude_data, codex_data, diagnostics=diagnostics)
+    update_status = VersionChecker().check(force=force, diagnostics=diagnostics)
+
+    _write_panel_status(claude_data, codex_data, update_status, diagnostics=diagnostics)
     diagnostics.log("manual refresh finished")
     print("[QuotaHalo] Refreshed once", flush=True)
 

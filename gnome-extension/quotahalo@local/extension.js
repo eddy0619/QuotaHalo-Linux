@@ -3,10 +3,12 @@ var Cairo = imports.cairo;
 var Clutter = imports.gi.Clutter;
 var Gio = imports.gi.Gio;
 var GLib = imports.gi.GLib;
+var Pango = imports.gi.Pango;
 var St = imports.gi.St;
 
 var ExtensionUtils = imports.misc.extensionUtils;
 var Main = imports.ui.main;
+var MessageTray = imports.ui.messageTray;
 var PopupMenu = imports.ui.popupMenu;
 var Me = ExtensionUtils.getCurrentExtension();
 
@@ -63,9 +65,19 @@ var REFRESH_DEBUG_PATH = GLib.build_filenamev([
     'quotahalo',
     'extension-refresh-debug.json',
 ]);
+var UPDATE_DEBUG_PATH = GLib.build_filenamev([
+    GLib.get_home_dir(),
+    '.cache',
+    'quotahalo',
+    'extension-update-debug.json',
+]);
 var PANEL_LAYOUT_PATH = GLib.build_filenamev([
     CACHE_DIR,
     'panel-layout.json',
+]);
+var UPDATE_DISMISSED_PATH = GLib.build_filenamev([
+    CACHE_DIR,
+    'update-dismissed.json',
 ]);
 var SCRIPT_PATH = INSTALL_CONFIG.status_script || GLib.build_filenamev([
     GLib.get_home_dir(),
@@ -151,6 +163,61 @@ function readCopilotStatus() {
         return status;
     } catch (e) {
         return fallbackCopilotStatus();
+    }
+}
+
+function updateAvailable(update) {
+    return !!(update && update.update_available &&
+        update.latest_version && update.current_version &&
+        String(update.latest_version) !== String(update.current_version));
+}
+
+function updateChangelogText(update, limit) {
+    var changelog = update && update.changelog ? update.changelog : [];
+    var parts = [];
+    var i;
+
+    limit = limit || 4;
+    for (i = 0; i < Math.min(changelog.length, limit); i++) {
+        if (changelog[i])
+            parts.push(String(changelog[i]));
+    }
+    if (changelog.length > limit)
+        parts.push('More changes available on GitHub');
+    return parts.join('\n');
+}
+
+function updateReminderText(update) {
+    var latest;
+
+    if (!updateAvailable(update))
+        return '';
+    latest = String(update.latest_version);
+    return 'Update available: ' + latest;
+}
+
+function readDismissedUpdateVersion() {
+    try {
+        var result = GLib.file_get_contents(UPDATE_DISMISSED_PATH);
+        var parsed;
+        if (!result[0])
+            return '';
+        parsed = JSON.parse(ByteArray.toString(result[1]));
+        return String(parsed.dismissed_version || '');
+    } catch (e) {
+        return '';
+    }
+}
+
+function writeDismissedUpdateVersion(version) {
+    try {
+        GLib.mkdir_with_parents(CACHE_DIR, 448);
+        GLib.file_set_contents(UPDATE_DISMISSED_PATH, JSON.stringify({
+            dismissed_version: String(version || ''),
+            dismissed_at: new Date().toISOString(),
+        }, null, 2) + '\n');
+    } catch (e) {
+        log('quotahalo update dismiss write failed: ' + e);
     }
 }
 
@@ -605,6 +672,15 @@ function setItemVisible(item, visible) {
         actor.hide();
 }
 
+function setLabelEllipsize(label) {
+    if (!label || !label.clutter_text)
+        return;
+    if (label.clutter_text.set_line_wrap)
+        label.clutter_text.set_line_wrap(false);
+    if (label.clutter_text.set_ellipsize)
+        label.clutter_text.set_ellipsize(Pango.EllipsizeMode.END);
+}
+
 function addItemStyle(item, styleClass) {
     var actor = itemActor(item);
 
@@ -642,7 +718,7 @@ function unavailableDetailText(status) {
     var error = statusErrorText(status);
 
     if (error)
-        return 'Usage unavailable  ·  ' + error;
+        return 'Usage unavailable  ·  details sent as notification';
     return 'Usage unavailable  ·  ' + providerSourceText(status);
 }
 
@@ -668,6 +744,13 @@ function writeDebug(payload) {
 function writeRefreshDebug(payload) {
     try {
         GLib.file_set_contents(REFRESH_DEBUG_PATH, JSON.stringify(payload, null, 2));
+    } catch (e) {
+    }
+}
+
+function writeUpdateUiDebug(payload) {
+    try {
+        GLib.file_set_contents(UPDATE_DEBUG_PATH, JSON.stringify(payload, null, 2));
     } catch (e) {
     }
 }
@@ -1133,6 +1216,10 @@ QuotaHaloUsageIndicator.prototype = {
         this._buttonPressId = 0;
         this._keyPressId = 0;
         this._refreshing = false;
+        this._notifiedUpdateVersion = '';
+        this._updateSource = null;
+        this._lastUpdateDebugKey = '';
+        this._notifiedProviderErrorKeys = {};
         this._copilotLabel = new St.Label({
             text: copilotLabelText(copilotStatus),
             y_align: Clutter.ActorAlign.CENTER,
@@ -1317,6 +1404,11 @@ QuotaHaloUsageIndicator.prototype = {
         this._claudeSeparator = new PopupMenu.PopupSeparatorMenuItem();
         this.menu.addMenuItem(this._claudeSeparator);
 
+        this._updateItem = this._addMessageItem('');
+        addItemStyle(this._updateItem.item, 'quotahalo-update-item');
+        if (this._updateItem.label.add_style_class_name)
+            this._updateItem.label.add_style_class_name('quotahalo-update-label');
+
         this._actionsControl = addUsageActionsControl(this.menu, function() {
             if (!self._refreshing) {
                 self._requestCopilotRefresh();
@@ -1456,6 +1548,9 @@ QuotaHaloUsageIndicator.prototype = {
         titleRow.add_child(metaLabel);
         labels.add_child(titleRow);
         labels.add_child(subtitleLabel);
+        setLabelEllipsize(titleLabel);
+        setLabelEllipsize(metaLabel);
+        setLabelEllipsize(subtitleLabel);
         metaLabel.hide();
         subtitleLabel.hide();
         box.add_child(badge);
@@ -1519,6 +1614,9 @@ QuotaHaloUsageIndicator.prototype = {
             segments: [],
         };
 
+        setLabelEllipsize(titleLabel);
+        setLabelEllipsize(valueLabel);
+        setLabelEllipsize(metaLabel);
         bar.connect('repaint', function(area) {
             drawProgressBar(area, row.pct, provider, row.segments);
         });
@@ -1545,6 +1643,7 @@ QuotaHaloUsageIndicator.prototype = {
             style_class: 'quotahalo-message-label',
         });
 
+        setLabelEllipsize(label);
         item.add_child(label);
         this.menu.addMenuItem(item);
         return { item: item, label: label };
@@ -1568,6 +1667,8 @@ QuotaHaloUsageIndicator.prototype = {
             style_class: 'quotahalo-meta-value',
         });
 
+        setLabelEllipsize(keyLabel);
+        setLabelEllipsize(valueLabel);
         item.add_child(keyLabel);
         item.add_child(valueLabel);
         this.menu.addMenuItem(item);
@@ -1626,6 +1727,7 @@ QuotaHaloUsageIndicator.prototype = {
             setItemVisible(this._copilotItem.item, false);
             setItemVisible(this._copilotUnavailableItem.item, true);
             this._copilotUnavailableItem.label.set_text(unavailableDetailText(status));
+            this._notifyProviderError('Copilot', status);
             return true;
         }
 
@@ -1690,6 +1792,7 @@ QuotaHaloUsageIndicator.prototype = {
             setItemVisible(this._weeklyItem.item, false);
             setItemVisible(this._codexUnavailableItem.item, true);
             this._codexUnavailableItem.label.set_text(unavailableDetailText(status));
+            this._notifyProviderError('Codex', status);
             return true;
         }
 
@@ -1746,6 +1849,7 @@ QuotaHaloUsageIndicator.prototype = {
             setItemVisible(this._claudeWeeklyItem.item, false);
             setItemVisible(this._claudeUnavailableItem.item, true);
             this._claudeUnavailableItem.label.set_text(unavailableDetailText(claude));
+            this._notifyProviderError('Claude', claude);
             return true;
         }
         setItemVisible(this._claudeItem.item, true);
@@ -1766,6 +1870,104 @@ QuotaHaloUsageIndicator.prototype = {
             claude.weekly_reset,
             true);
         return true;
+    },
+
+    _notifyProviderError: function(providerName, status) {
+        var error = statusErrorText(status);
+        var key;
+
+        if (!error)
+            return;
+        key = String(providerName) + ':' + error;
+        if (this._notifiedProviderErrorKeys[key])
+            return;
+        this._notifiedProviderErrorKeys[key] = true;
+        try {
+            Main.notify('QuotaHalo ' + providerName, error);
+        } catch (e) {
+            log('quotahalo provider notification failed: ' + e);
+        }
+    },
+
+    _setUpdateDetails: function(status) {
+        var update = status && status.update ? status.update : null;
+        var text = updateReminderText(update);
+
+        if (!text) {
+            setItemVisible(this._updateItem.item, false);
+            return false;
+        }
+        this._updateItem.label.set_text(text);
+        setItemVisible(this._updateItem.item, true);
+        return true;
+    },
+
+    _maybeNotifyUpdate: function(update, forceNotify) {
+        var version;
+        var dismissed;
+
+        if (!updateAvailable(update))
+            return;
+        version = String(update.latest_version);
+        dismissed = readDismissedUpdateVersion();
+        if (dismissed === version)
+            return;
+        if (!forceNotify && this._notifiedUpdateVersion === version)
+            return;
+        this._notifiedUpdateVersion = version;
+        this._showUpdateNotification(update);
+    },
+
+    _showUpdateNotification: function(update) {
+        var version = String(update.latest_version);
+        var title = 'QuotaHalo ' + version + ' is available';
+        var body = updateChangelogText(update, 5) || 'A new GitHub tag is available.';
+        var notification;
+
+        try {
+            if (!this._updateSource) {
+                this._updateSource = new MessageTray.Source('QuotaHalo');
+                Main.messageTray.add(this._updateSource);
+            }
+            notification = new MessageTray.Notification(this._updateSource, title, body);
+            if (notification.addAction) {
+                notification.addAction('Do not remind ' + version, function() {
+                    writeDismissedUpdateVersion(version);
+                });
+            }
+            this._updateSource.showNotification(notification);
+        } catch (e) {
+            try {
+                Main.notify(title, body);
+            } catch (notifyError) {
+                log('quotahalo update notification failed: ' + notifyError);
+            }
+        }
+    },
+
+    _writeUpdateDebug: function(update, showUpdate, showCopilot, showCodex, showClaude, footerVisible, forceNotify) {
+        var info = {
+            currentVersion: update && update.current_version ? String(update.current_version) : '',
+            latestVersion: update && update.latest_version ? String(update.latest_version) : '',
+            available: updateAvailable(update),
+            dismissedVersion: readDismissedUpdateVersion(),
+            notifiedVersion: this._notifiedUpdateVersion || '',
+            showUpdate: !!showUpdate,
+            showCopilot: !!showCopilot,
+            showCodex: !!showCodex,
+            showClaude: !!showClaude,
+            footerVisible: !!footerVisible,
+            forceNotify: !!forceNotify,
+        };
+        var key = JSON.stringify(info);
+
+        if (key === this._lastUpdateDebugKey)
+            return;
+        this._lastUpdateDebugKey = key;
+        writeUpdateUiDebug({
+            reason: 'update',
+            update: info,
+        });
     },
 
     _setProviderHeaderLines: function(header, metaText, subtitleText) {
@@ -1937,7 +2139,7 @@ QuotaHaloUsageIndicator.prototype = {
                     setButtonEnabled(self._refreshItem, true);
                 if (manual)
                     setButtonLabel(self._refreshItem, 'Refresh now');
-                self._update();
+                self._update(manual);
             });
         } catch (e) {
             log('quotahalo-usage refresh spawn failed: ' + e);
@@ -1977,12 +2179,13 @@ QuotaHaloUsageIndicator.prototype = {
         }
     },
 
-    _update: function() {
+    _update: function(forceNotify) {
         var status = readStatus();
         var copilotStatus = readCopilotStatus();
         var showCopilot;
         var showCodex;
         var showClaude;
+        var showUpdate;
         var footerVisible;
 
         this._setCopilotLabel(copilotStatus);
@@ -2001,7 +2204,18 @@ QuotaHaloUsageIndicator.prototype = {
         showCopilot = this._setCopilotDetails(copilotStatus);
         showCodex = this._setCodexDetails(status);
         showClaude = this._setClaudeDetails(status);
-        footerVisible = showCopilot || showCodex || showClaude;
+        showUpdate = this._setUpdateDetails(status);
+        this._maybeNotifyUpdate(status.update, !!forceNotify);
+        footerVisible = showCopilot || showCodex || showClaude || showUpdate;
+        setItemVisible(this._updateItem.item, showUpdate);
+        this._writeUpdateDebug(
+            status.update,
+            showUpdate,
+            showCopilot,
+            showCodex,
+            showClaude,
+            footerVisible,
+            !!forceNotify);
 
         if (footerVisible)
             this._button.show();
@@ -2055,6 +2269,10 @@ QuotaHaloUsageIndicator.prototype = {
         if (this._startupRefreshTimeoutId) {
             GLib.Source.remove(this._startupRefreshTimeoutId);
             this._startupRefreshTimeoutId = 0;
+        }
+        if (this._updateSource) {
+            this._updateSource.destroy();
+            this._updateSource = null;
         }
         if (this.menu) {
             this.menu.destroy();

@@ -15,6 +15,7 @@ ASSET_DIR="${REPO_DIR}/assets"
 SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 PYTHON_BIN="${REPO_DIR}/venv/bin/python3"
 EXTENSION_NEEDS_RELOAD=0
+EXTENSION_CODE_CHANGED=0
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
     PYTHON_BIN="$(command -v python3)"
@@ -26,6 +27,9 @@ if ! command -v gnome-extensions >/dev/null 2>&1; then
     exit 1
 fi
 
+if [[ -f "${DST_DIR}/extension.js" ]] && ! cmp -s "${SRC_DIR}/extension.js" "${DST_DIR}/extension.js"; then
+    EXTENSION_CODE_CHANGED=1
+fi
 mkdir -p "${DST_DIR}"
 cp "${SRC_DIR}/metadata.json" "${SRC_DIR}/extension.js" "${SRC_DIR}/stylesheet.css" "${DST_DIR}/"
 cp "${ASSET_DIR}/openai-icon.png" "${DST_DIR}/"
@@ -41,12 +45,19 @@ from pathlib import Path
 config_path = Path(sys.argv[1])
 repo_dir = Path(sys.argv[2]).resolve()
 python_bin = sys.argv[3]
+version = "v0.1.0"
+try:
+    version = (repo_dir / "VERSION").read_text(encoding="utf-8").strip() or version
+except Exception:
+    pass
 
 payload = {
     "repo_dir": str(repo_dir),
     "python_bin": python_bin,
     "status_script": str(repo_dir / "quota_halo_status.py"),
     "copilot_script": str(repo_dir / "copilot_status_service.py"),
+    "current_version": version,
+    "github_repo": "eddy0619/QuotaHalo-Linux",
 }
 config_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 PY
@@ -127,4 +138,7 @@ echo "Installed and enabled ${UUID}."
 echo "QuotaHalo refresh timer and Copilot usage service are enabled."
 if [[ "${EXTENSION_NEEDS_RELOAD}" == "1" ]]; then
     echo "Reload GNOME Shell to activate the newly installed extension."
+elif [[ "${EXTENSION_CODE_CHANGED}" == "1" ]]; then
+    echo "GNOME Shell may keep the previous extension JS in memory."
+    echo "Reload GNOME Shell to apply this update: Alt+F2, type r, press Enter on X11; log out and back in on Wayland."
 fi

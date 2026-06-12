@@ -80,11 +80,15 @@
 }
 
 .quotahalo-usage-menu {
+  width: 316px;
   min-width: 316px;
+  max-width: 316px;
 }
 
 .quotahalo-system-menu {
+  width: 316px;
   min-width: 316px;
+  max-width: 316px;
 }
 
 .quotahalo-usage-menu .popup-menu-content,
@@ -227,6 +231,17 @@
   color: rgba(203, 213, 225, 0.82);
   font-size: 12px;
   font-weight: 500;
+}
+
+.quotahalo-update-item {
+  padding: 8px 14px 10px;
+  background-color: rgba(45, 212, 191, 0.08);
+}
+
+.quotahalo-update-label {
+  color: rgba(153, 246, 228, 0.96);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .quotahalo-meta-item {

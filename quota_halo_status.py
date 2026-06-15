@@ -1493,6 +1493,7 @@ class CodexDataFetcher:
         matching_lines = 0
         token_count_events = 0
         rate_limit_events = 0
+        empty_rate_limit_events = 0
         invalid_lines = 0
         try:
             with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as fh:
@@ -1509,6 +1510,9 @@ class CodexDataFetcher:
                             rl = p.get("rate_limits")
                             if rl:
                                 rate_limit_events += 1
+                                if not CodexDataFetcher._has_rate_limit_window(rl):
+                                    empty_rate_limit_events += 1
+                                    continue
                                 updated, sort_key = CodexDataFetcher._format_event_time(
                                     e.get("timestamp"), jsonl_path)
                                 if sort_key > best_sort_key:
@@ -1528,6 +1532,7 @@ class CodexDataFetcher:
                 matching_lines=matching_lines,
                 token_count_events=token_count_events,
                 rate_limit_events=rate_limit_events,
+                empty_rate_limit_events=empty_rate_limit_events,
                 invalid_lines=invalid_lines,
                 found=bool(best),
                 updated=best_updated,
@@ -1535,6 +1540,14 @@ class CodexDataFetcher:
         if not best:
             return None
         return best, best_updated, best_sort_key
+
+    @staticmethod
+    def _has_rate_limit_window(rate_limits):
+        if not isinstance(rate_limits, dict):
+            return False
+        return isinstance(rate_limits.get("primary"), dict) or isinstance(
+            rate_limits.get("secondary"), dict
+        )
 
     @staticmethod
     def _to_epoch(value):

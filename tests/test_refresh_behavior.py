@@ -131,6 +131,63 @@ class RefreshBehaviorTests(unittest.TestCase):
             self.assertEqual(data["source"], "sessions")
             self.assertEqual(data["session_used_pct"], 12)
 
+    def test_codex_ignores_empty_latest_rate_limit_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_dir = Path(tmp) / ".codex"
+            sessions_dir = codex_dir / "sessions"
+            sessions_dir.mkdir(parents=True)
+
+            session_file = sessions_dir / "session.jsonl"
+            now_epoch = int(time.time())
+            session_file.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-06-15T06:14:00Z",
+                        "payload": {
+                            "type": "token_count",
+                            "rate_limits": {
+                                "primary": {
+                                    "used_percent": 100,
+                                    "resets_at": now_epoch + 1800,
+                                },
+                                "secondary": {
+                                    "used_percent": 72,
+                                    "resets_at": now_epoch + 86400,
+                                },
+                            },
+                        },
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "timestamp": "2026-06-15T06:15:00Z",
+                        "payload": {
+                            "type": "token_count",
+                            "rate_limits": {
+                                "primary": None,
+                                "secondary": None,
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            original_codex_dir = qhs.CodexDataFetcher.CODEX_DIR
+            qhs.CodexDataFetcher.CODEX_DIR = codex_dir
+            try:
+                data = qhs.CodexDataFetcher().fetch()
+            finally:
+                qhs.CodexDataFetcher.CODEX_DIR = original_codex_dir
+
+            self.assertEqual(data["source"], "sessions")
+            self.assertEqual(data["session_used_pct"], 100)
+            self.assertEqual(data["weekly_used_pct"], 72)
+            self.assertNotEqual(data["session_reset"], "unknown")
+            self.assertNotEqual(data["weekly_reset"], "unknown")
+
     def test_copilot_refresh_updates_ui_after_subprocess_finishes(self):
         extension_path = (
             Path(__file__).resolve().parents[1]

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fixed Codex quota parsing when the latest local rate-limit event is empty and the previous event still contains valid 5h/7d usage.
+
 ## v0.2.0 - 2026-06-12
 
 - Added GitHub tag based update checks with daily background polling and manual refresh checks.
@@ -10,6 +14,6 @@
 - Improved installer behavior for first-run GNOME extension setup.
 - Added system status improvements, including GPU hiding when unavailable and proxy public IP display through common local proxy ports.
 
-## v0.1.0 - 2026-06-12
+## v0.1.0 - 2026-06-08
 
 - Initial public release of QuotaHalo for Copilot, Codex, Claude, and system status monitoring in the GNOME top bar.

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added persistent system notifications with natural English messages for manual refresh failures and stale Claude usage refresh errors.
+- Provider refresh notifications now use the affected AI provider icon and repeat after manual refresh.
 - Fixed Codex quota parsing when the latest local rate-limit event is empty and the previous event still contains valid 5h/7d usage.
 
 ## v0.2.0 - 2026-06-12

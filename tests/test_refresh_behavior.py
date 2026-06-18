@@ -73,6 +73,78 @@ class RefreshBehaviorTests(unittest.TestCase):
             self.assertEqual(data["session_used_pct"], 44)
             self.assertEqual(data["weekly_used_pct"], 55)
 
+    def test_claude_stale_cache_preserves_refresh_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            status_dir = Path(tmp) / "quotahalo"
+            status_dir.mkdir()
+            status_path = status_dir / "usage-status.json"
+            cache_path = status_dir / "claude-usage-cache.json"
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "claude": {
+                            "provider": "Claude",
+                            "available": True,
+                            "plan": "Pro",
+                            "updated": "Updated 04:07:07",
+                            "updated_epoch": 1781554027,
+                            "session_used_pct": 14,
+                            "session_reset": "1h",
+                            "weekly_used_pct": 15,
+                            "weekly_reset": "2d",
+                            "source": "oauth",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class Fetcher(qhs.ClaudeDataFetcher):
+                def _fetch_oauth_api(self, force=False):
+                    data = self._empty()
+                    data.update(
+                        {
+                            "plan": "Pro",
+                            "source": "credentials",
+                            "error": "HTTP 429 Rate limited",
+                            "installed": True,
+                        }
+                    )
+                    return data
+
+                def _fetch_jsonl(self):
+                    return None
+
+                def _is_claude_installed(self):
+                    return True
+
+            original_status_dir = qhs.STATUS_DIR
+            original_status_file = qhs.STATUS_JSON_FILE
+            original_cache_file = qhs.CLAUDE_USAGE_CACHE_FILE
+            qhs.STATUS_DIR = status_dir
+            qhs.STATUS_JSON_FILE = status_path
+            qhs.CLAUDE_USAGE_CACHE_FILE = cache_path
+            try:
+                data = Fetcher().fetch_all(force=True)
+                payload = qhs._panel_status_payload(
+                    data,
+                    qhs.CodexDataFetcher._empty(),
+                )
+            finally:
+                qhs.STATUS_DIR = original_status_dir
+                qhs.STATUS_JSON_FILE = original_status_file
+                qhs.CLAUDE_USAGE_CACHE_FILE = original_cache_file
+
+            self.assertEqual(data["source"], "oauth")
+            self.assertEqual(data["session_used_pct"], 14)
+            self.assertTrue(data["stale"])
+            self.assertEqual(data["refresh_error"], "HTTP 429 Rate limited")
+            self.assertEqual(
+                payload["claude"]["refresh_error"],
+                "HTTP 429 Rate limited",
+            )
+            self.assertTrue(payload["claude"]["stale"])
+
     def test_codex_uses_latest_rate_limit_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             codex_dir = Path(tmp) / ".codex"
@@ -526,6 +598,38 @@ class RefreshBehaviorTests(unittest.TestCase):
         self.assertIn("showCopilot || showCodex || showClaude || showUpdate", text)
         self.assertIn("setItemVisible(this._updateItem.item, showUpdate)", text)
 
+    def test_extension_notifies_manual_refresh_failures(self):
+        extension_path = (
+            Path(__file__).resolve().parents[1]
+            / "gnome-extension"
+            / "quotahalo@local"
+            / "extension.js"
+        )
+        text = extension_path.read_text(encoding="utf-8")
+        match = re.search(
+            r"_requestRefresh: function\(manual\) \{(?P<body>.*?)\n    \},\n\n    _requestCopilotRefresh",
+            text,
+            re.S,
+        )
+        self.assertIsNotNone(match)
+        body = match.group("body")
+        self.assertIn("manual && !ok", body)
+        self.assertIn("_notifyRefreshFailure", body)
+        self.assertIn("QuotaHalo refresh failed", text)
+        self.assertIn("new MessageTray.Notification", text)
+        self.assertIn("setTransient(false)", text)
+        self.assertIn("setResident(true)", text)
+        self.assertIn("friendlyErrorText", text)
+        self.assertIn("usage check hit a rate limit. Please try again later.", text)
+        self.assertIn("_setCopilotDetails(copilotStatus, !!forceNotify)", text)
+        self.assertIn("_setCodexDetails(status, !!forceNotify)", text)
+        self.assertIn("_setClaudeDetails(status, !!forceNotify)", text)
+        self.assertIn("_notifyProviderError('Claude', claude, forceNotify)", text)
+        self.assertIn("!forceNotify && this._notifiedProviderErrorKeys[key]", text)
+        self.assertIn("providerIconPath(providerName)", text)
+        self.assertIn("source.createIcon = function(size)", text)
+        self.assertIn("new Gio.FileIcon", text)
+
     def test_extension_keeps_detail_width_stable_for_long_messages(self):
         root = Path(__file__).resolve().parents[1]
         extension_text = (
@@ -539,9 +643,9 @@ class RefreshBehaviorTests(unittest.TestCase):
         self.assertIn("setLabelEllipsize", extension_text)
         self.assertIn("return 'Update available: ' + latest;", extension_text)
         self.assertIn("details sent as notification", extension_text)
-        self.assertIn("_notifyProviderError('Copilot', status)", extension_text)
-        self.assertIn("_notifyProviderError('Codex', status)", extension_text)
-        self.assertIn("_notifyProviderError('Claude', claude)", extension_text)
+        self.assertIn("_notifyProviderError('Copilot', status, forceNotify)", extension_text)
+        self.assertIn("_notifyProviderError('Codex', status, forceNotify)", extension_text)
+        self.assertIn("_notifyProviderError('Claude', claude, forceNotify)", extension_text)
         self.assertNotIn("'Usage unavailable  ·  ' + error", extension_text)
         self.assertNotIn("changelog.replace", extension_text)
         self.assertNotIn("current ' + current", extension_text)

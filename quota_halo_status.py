@@ -839,6 +839,9 @@ class ClaudeDataFetcher:
                     if stale:
                         if cred.get("plan") and cred.get("plan") != "Unknown":
                             stale["plan"] = cred["plan"]
+                        if cred.get("error"):
+                            stale["refresh_error"] = cred["error"]
+                            stale["stale"] = True
                         self.data = stale
                         got_usage = True
                         used_usage_cache = True
@@ -1714,6 +1717,8 @@ def _panel_status_payload(claude, codex, update_status=None):
             "available": _has_claude_quota(claude),
             "source": claude.get("source", "none"),
             "error": claude.get("error"),
+            "refresh_error": claude.get("refresh_error"),
+            "stale": bool(claude.get("stale")),
             "updated": claude.get("updated", "Never"),
             "updated_epoch": claude.get("updated_epoch"),
             "plan": claude.get("plan", ""),
@@ -1788,6 +1793,8 @@ def refresh_once(force=False):
             weekly_used_pct=claude_data.get("weekly_used_pct"),
             updated=claude_data.get("updated"),
             error=claude_data.get("error"),
+            refresh_error=claude_data.get("refresh_error"),
+            stale=claude_data.get("stale"),
         )
     except Exception as e:
         print(f"[QuotaHalo] Claude refresh err: {e}", flush=True)

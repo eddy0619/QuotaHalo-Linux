@@ -652,6 +652,23 @@ class RefreshBehaviorTests(unittest.TestCase):
         self.assertIn("width: 420px;", stylesheet_text)
         self.assertIn("max-width: 420px;", stylesheet_text)
 
+    def test_system_ip_uses_proxy_then_direct_public_ip(self):
+        extension_path = (
+            Path(__file__).resolve().parents[1]
+            / "gnome-extension"
+            / "quotahalo@local"
+            / "extension.js"
+        )
+        text = extension_path.read_text(encoding="utf-8")
+
+        self.assertIn("this._addSystemMetaItem('Public IP', '--')", text)
+        self.assertIn("{ name: 'Direct public IP', direct: true }", text)
+        self.assertIn("if (candidate.direct)", text)
+        self.assertIn("'--noproxy'", text)
+        self.assertIn("'*'", text)
+        self.assertIn("'--proxy'", text)
+        self.assertIn("PROXY_CANDIDATES", text)
+
     def test_self_updater_refuses_dirty_workspace(self):
         calls = []
 

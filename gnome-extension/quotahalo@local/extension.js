@@ -105,6 +105,7 @@ var PROXY_CANDIDATES = [
     { name: 'Clash Verge', url: 'http://127.0.0.1:7897' },
     { name: 'Clash/Mihomo', url: 'http://127.0.0.1:7891' },
     { name: 'Local proxy', url: 'http://127.0.0.1:8080' },
+    { name: 'Direct public IP', direct: true },
 ];
 
 var usageIndicator = null;
@@ -2562,7 +2563,7 @@ QuotaHaloSystemIndicator.prototype = {
         this._ifaceItem = this._addSystemMetaItem('Interfaces', '--');
         this._flclashSeparator = new PopupMenu.PopupSeparatorMenuItem();
         this.menu.addMenuItem(this._flclashSeparator);
-        this._flclashIpItem = this._addSystemMetaItem('Proxy IP', '--');
+        this._flclashIpItem = this._addSystemMetaItem('Public IP', '--');
         this._flclashLocationItem = this._addSystemMetaItem('Location', '--');
         this._flclashOrgItem = this._addSystemMetaItem('Org', '--');
         this._flclashHostItem = this._addSystemMetaItem('Host', '--');
@@ -2917,7 +2918,9 @@ QuotaHaloSystemIndicator.prototype = {
 
     _proxyText: function() {
         if (!this._flclashProxy)
-            return 'detecting local proxy';
+            return 'detecting public IP';
+        if (this._flclashProxy.direct)
+            return this._flclashProxy.name;
         return this._flclashProxy.name + ' ' + this._flclashProxy.url;
     },
 
@@ -3034,8 +3037,21 @@ QuotaHaloSystemIndicator.prototype = {
             return;
         }
         try {
-            proc = Gio.Subprocess.new(
-                [
+            var command;
+            if (candidate.direct) {
+                command = [
+                    '/usr/bin/curl',
+                    '-sS',
+                    '--connect-timeout',
+                    '2',
+                    '--max-time',
+                    '5',
+                    '--noproxy',
+                    '*',
+                    PROXY_IPINFO_URL,
+                ];
+            } else {
+                command = [
                     '/usr/bin/curl',
                     '-sS',
                     '--connect-timeout',
@@ -3045,7 +3061,10 @@ QuotaHaloSystemIndicator.prototype = {
                     '--proxy',
                     candidate.url,
                     PROXY_IPINFO_URL,
-                ],
+                ];
+            }
+            proc = Gio.Subprocess.new(
+                command,
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
             proc.communicate_utf8_async(null, null, function(subprocess, res) {
                 var result;

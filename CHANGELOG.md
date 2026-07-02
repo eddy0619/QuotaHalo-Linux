@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed self-update hangs by using GitHub SSH over port 443, adding command timeouts, and showing update failures in the panel.
+
 ## v0.2.1 - 2026-07-01
 
 - System status public IP now falls back to direct public IP lookup when no local proxy is available.

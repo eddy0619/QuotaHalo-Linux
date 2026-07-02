@@ -26,7 +26,13 @@ PROJECT_DIR = Path(__file__).resolve().parent
 VERSION_FILE = PROJECT_DIR / "VERSION"
 GITHUB_REPO = os.environ.get("QUOTAHALO_GITHUB_REPO", "eddy0619/QuotaHalo-Linux")
 GITHUB_API_BASE = "https://api.github.com"
+GITHUB_SSH_COMMAND = (
+    "ssh -o BatchMode=yes -o HostName=ssh.github.com -o Port=443 "
+    "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "
+    "-o ServerAliveInterval=5 -o ServerAliveCountMax=1"
+)
 UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+SELF_UPDATE_COMMAND_TIMEOUT_SECONDS = 90
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CLAUDE_USAGE_QUERY_TRASH_DIR = STATUS_DIR / "claude-usage-query-trash"
 CLAUDE_USAGE_REFRESH_SECONDS = 300
@@ -462,7 +468,14 @@ class SelfUpdater:
 
             backup = self._backup_branch_name()
             self._run(["git", "branch", backup, "HEAD"])
-            self._run(["git", "fetch", "--tags", "origin"])
+            self._run([
+                "git",
+                "-c",
+                f"core.sshCommand={GITHUB_SSH_COMMAND}",
+                "fetch",
+                "--tags",
+                "origin",
+            ])
             self._run(["git", "rev-parse", "--verify", f"refs/tags/{target}"])
             self._run(["git", "checkout", "--detach", f"tags/{target}"])
             self._run([str(self.repo_dir / "install-gnome-extension.sh")])
@@ -479,7 +492,13 @@ class SelfUpdater:
             return self._failure(str(e))
 
     def _run(self, command):
-        result = self.runner(list(command), cwd=self.repo_dir)
+        try:
+            result = self.runner(list(command), cwd=self.repo_dir)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"Command timed out after {SELF_UPDATE_COMMAND_TIMEOUT_SECONDS}s: "
+                f"{' '.join(command)}"
+            ) from e
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(detail or f"Command failed: {' '.join(command)}")
@@ -497,6 +516,7 @@ class SelfUpdater:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=SELF_UPDATE_COMMAND_TIMEOUT_SECONDS,
         )
 
     @staticmethod

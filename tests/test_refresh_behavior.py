@@ -541,13 +541,13 @@ class RefreshBehaviorTests(unittest.TestCase):
     def test_release_version_does_not_prompt_when_latest_tag_matches(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = Path(tmp) / "update-status.json"
+            current = qhs._read_current_version()
 
             def fetch_json(url):
                 if url.endswith("/tags"):
-                    return [{"name": "v0.2.0"}, {"name": "v0.1.0"}]
+                    return [{"name": current}, {"name": "v0.1.0"}]
                 raise AssertionError(f"unexpected url: {url}")
 
-            current = qhs._read_current_version()
             checker = qhs.VersionChecker(
                 current_version=current,
                 repo="owner/repo",
@@ -557,8 +557,7 @@ class RefreshBehaviorTests(unittest.TestCase):
             )
             status = checker.check(force=True)
 
-            self.assertEqual(current, "v0.2.0")
-            self.assertEqual(status["latest_version"], "v0.2.0")
+            self.assertEqual(status["latest_version"], current)
             self.assertFalse(status["update_available"])
             self.assertEqual(status["changelog"], [])
 
@@ -706,10 +705,31 @@ class RefreshBehaviorTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["target_version"], "v0.1.1-test")
         self.assertIn(["git", "branch", "backup/before-update-20260612-200004", "HEAD"], calls)
-        self.assertIn(["git", "fetch", "--tags", "origin"], calls)
+        self.assertTrue(
+            any(
+                command[:3] == ["git", "-c", f"core.sshCommand={qhs.GITHUB_SSH_COMMAND}"]
+                and command[3:] == ["fetch", "--tags", "origin"]
+                for command in calls
+            ),
+            calls,
+        )
         self.assertIn(["git", "rev-parse", "--verify", "refs/tags/v0.1.1-test"], calls)
         self.assertIn(["git", "checkout", "--detach", "tags/v0.1.1-test"], calls)
         self.assertIn([str(Path(tmp) / "install-gnome-extension.sh")], calls)
+
+    def test_self_updater_reports_timeout(self):
+        def runner(command, cwd=None):
+            if command[:4] == ["git", "-c", f"core.sshCommand={qhs.GITHUB_SSH_COMMAND}", "fetch"]:
+                raise subprocess.TimeoutExpired(command, qhs.SELF_UPDATE_COMMAND_TIMEOUT_SECONDS)
+            if command[:3] == ["git", "status", "--porcelain"]:
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = qhs.SelfUpdater(repo_dir=Path(tmp), runner=runner).update("v0.1.1-test")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("timed out", result["error"].lower())
 
     def test_extension_update_row_has_update_button_and_golden_width(self):
         root = Path(__file__).resolve().parents[1]
@@ -723,6 +743,9 @@ class RefreshBehaviorTests(unittest.TestCase):
         self.assertIn("_addUpdateItem", extension_text)
         self.assertIn("self._requestSelfUpdate(update.latest_version)", extension_text)
         self.assertIn("--self-update", extension_text)
+        self.assertIn("Update failed: ", extension_text)
+        self.assertIn("'Retry'", extension_text)
+        self.assertIn("_updateErrorText", extension_text)
         self.assertIn("quotahalo-update-button", stylesheet_text)
         self.assertIn("width: 420px;", stylesheet_text)
         self.assertIn("max-width: 420px;", stylesheet_text)

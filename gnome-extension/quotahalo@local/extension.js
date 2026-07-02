@@ -1278,6 +1278,7 @@ QuotaHaloUsageIndicator.prototype = {
         this._keyPressId = 0;
         this._refreshing = false;
         this._selfUpdating = false;
+        this._updateErrorText = '';
         this._notifiedUpdateVersion = '';
         this._notificationSources = {};
         this._lastUpdateDebugKey = '';
@@ -2047,13 +2048,17 @@ QuotaHaloUsageIndicator.prototype = {
     _setUpdateDetails: function(status) {
         var update = status && status.update ? status.update : null;
         var text = updateReminderText(update);
+        var errorText = this._updateErrorText;
 
-        if (!text) {
+        if (!text && !errorText) {
             setItemVisible(this._updateItem.item, false);
             return false;
         }
-        this._updateItem.label.set_text(text);
-        setButtonLabel(this._updateItem.button, this._selfUpdating ? 'Updating' : 'Update');
+        this._updateItem.label.set_text(
+            errorText ? 'Update failed: ' + compactErrorText(errorText) : text);
+        setButtonLabel(
+            this._updateItem.button,
+            this._selfUpdating ? 'Updating' : (errorText ? 'Retry' : 'Update'));
         setButtonEnabled(this._updateItem.button, !this._selfUpdating);
         setItemVisible(this._updateItem.item, true);
         return true;
@@ -2337,6 +2342,8 @@ QuotaHaloUsageIndicator.prototype = {
             return;
         command = [PYTHON_PATH, SCRIPT_PATH, '--self-update', version];
         this._selfUpdating = true;
+        this._updateErrorText = '';
+        this._update();
         setButtonLabel(this._updateItem.button, 'Updating');
         setButtonEnabled(this._updateItem.button, false);
         try {
@@ -2361,15 +2368,19 @@ QuotaHaloUsageIndicator.prototype = {
                         payload = null;
                     }
                     if (ok && payload && payload.ok) {
+                        self._updateErrorText = '';
                         message = payload.message || ('Updated to ' + version);
                         Main.notify('QuotaHalo update complete', message);
                     } else {
                         message = (payload && payload.error) || stderr || stdout || 'Update failed';
+                        self._updateErrorText = message;
                         Main.notify('QuotaHalo update failed', message);
                     }
                 } catch (e) {
                     log('quotahalo self update failed: ' + e);
-                    Main.notify('QuotaHalo update failed', String(e));
+                    message = String(e);
+                    self._updateErrorText = message;
+                    Main.notify('QuotaHalo update failed', message);
                 }
                 self._selfUpdating = false;
                 setButtonLabel(self._updateItem.button, 'Update');
@@ -2378,6 +2389,7 @@ QuotaHaloUsageIndicator.prototype = {
             });
         } catch (e) {
             this._selfUpdating = false;
+            this._updateErrorText = String(e);
             setButtonLabel(this._updateItem.button, 'Update');
             setButtonEnabled(this._updateItem.button, true);
             Main.notify('QuotaHalo update failed', String(e));

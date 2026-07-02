@@ -260,6 +260,28 @@ class RefreshBehaviorTests(unittest.TestCase):
             self.assertNotEqual(data["session_reset"], "unknown")
             self.assertNotEqual(data["weekly_reset"], "unknown")
 
+    def test_codex_cost_scan_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            now = time.time()
+            files = []
+
+            for i in range(qhs.CODEX_COST_SCAN_MAX_FILES + 5):
+                path = base / f"recent-{i}.jsonl"
+                path.write_text("", encoding="utf-8")
+                os.utime(path, (now - i, now - i))
+                files.append(path)
+            old_path = base / "old.jsonl"
+            old_path.write_text("", encoding="utf-8")
+            old_mtime = now - (qhs.CODEX_COST_SCAN_DAYS + 2) * 24 * 60 * 60
+            os.utime(old_path, (old_mtime, old_mtime))
+            files.append(old_path)
+
+            selected = qhs.CodexDataFetcher._cost_scan_files(files)
+
+            self.assertLessEqual(len(selected), qhs.CODEX_COST_SCAN_MAX_FILES)
+            self.assertNotIn(old_path, selected)
+
     def test_copilot_refresh_updates_ui_after_subprocess_finishes(self):
         extension_path = (
             Path(__file__).resolve().parents[1]
@@ -596,6 +618,22 @@ class RefreshBehaviorTests(unittest.TestCase):
         self.assertIn("_maybeNotifyUpdate(status.update, !!forceNotify)", text)
         self.assertIn("showCopilot || showCodex || showClaude || showUpdate", text)
         self.assertIn("setItemVisible(this._updateItem.item, showUpdate)", text)
+
+    def test_extension_uses_systemd_for_background_refresh(self):
+        root = Path(__file__).resolve().parents[1]
+        extension_text = (
+            root / "gnome-extension" / "quotahalo@local" / "extension.js"
+        ).read_text(encoding="utf-8")
+        timer_text = (root / "systemd" / "quotahalo-refresh.timer").read_text(encoding="utf-8")
+        service_text = (
+            root / "systemd" / "quotahalo-refresh.service.in"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("USAGE_REFRESH_SECONDS", extension_text)
+        self.assertNotIn("self._requestRefresh(false);", extension_text)
+        self.assertNotIn("nvidia-smi", extension_text)
+        self.assertIn("OnUnitActiveSec=5min", timer_text)
+        self.assertIn("TimeoutStartSec=120", service_text)
 
     def test_extension_notifies_manual_refresh_failures(self):
         extension_path = (

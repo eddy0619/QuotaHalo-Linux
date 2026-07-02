@@ -38,6 +38,8 @@ CLAUDE_USAGE_QUERY_TRASH_DIR = STATUS_DIR / "claude-usage-query-trash"
 CLAUDE_USAGE_REFRESH_SECONDS = 300
 CLAUDE_OAUTH_BACKOFF_SECONDS = 300
 USAGE_QUERY_PROMPTS = {"/usage", "usage"}
+CODEX_COST_SCAN_DAYS = 10
+CODEX_COST_SCAN_MAX_FILES = 80
 
 
 class ManualRefreshDiagnostics:
@@ -1473,8 +1475,9 @@ class CodexDataFetcher:
 
         total_in = total_out = today_in = today_out = 0
         today = datetime.now().date()
+        cost_files = self._cost_scan_files(jsonl_files)
 
-        for jf in jsonl_files:
+        for jf in cost_files:
             try:
                 tokens = self._extract_total_tokens(jf)
                 if not tokens:
@@ -1507,6 +1510,30 @@ class CodexDataFetcher:
         d["cost_today_tokens"] = fmt(today_in + today_out)
         d["cost_30d"] = round(c30, 2)
         d["cost_30d_tokens"] = fmt(total_in + total_out)
+        if diagnostics:
+            diagnostics.log(
+                "Codex cost scan finished",
+                scanned_files=len(cost_files),
+                available_files=len(jsonl_files),
+                window_days=CODEX_COST_SCAN_DAYS,
+                max_files=CODEX_COST_SCAN_MAX_FILES,
+            )
+
+    @staticmethod
+    def _cost_scan_files(jsonl_files):
+        cutoff = time.time() - CODEX_COST_SCAN_DAYS * 24 * 60 * 60
+        selected = []
+
+        for path in jsonl_files:
+            if len(selected) >= CODEX_COST_SCAN_MAX_FILES:
+                break
+            try:
+                if path.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+            selected.append(path)
+        return selected
 
     @staticmethod
     def _extract_rate_limits(jsonl_path, diagnostics=None):

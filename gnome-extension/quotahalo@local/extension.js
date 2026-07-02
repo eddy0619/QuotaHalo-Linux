@@ -95,7 +95,6 @@ var OPENAI_ICON_PATH = GLib.build_filenamev([Me.path, 'openai-icon.png']);
 var CLAUDE_ICON_PATH = GLib.build_filenamev([Me.path, 'claude-icon.png']);
 var COPILOT_ICON_PATH = GLib.build_filenamev([Me.path, 'github-copilot-icon.png']);
 var SYSTEM_UPDATE_SECONDS = 2;
-var USAGE_REFRESH_SECONDS = 30;
 var GPU_CACHE_USEC = 3 * 1000 * 1000;
 var PROXY_IPINFO_URL = 'https://ipinfo.io/json';
 var PROXY_UPDATE_SECONDS = 60;
@@ -1238,28 +1237,6 @@ function readGpuBusyFromSysfs() {
     return null;
 }
 
-function readGpuBusyFromNvidiaSmi() {
-    var result;
-    var ok;
-    var stdout;
-    var first;
-
-    try {
-        result = GLib.spawn_command_line_sync(
-            'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits');
-        ok = result[0];
-        if (!ok)
-            return null;
-        stdout = ByteArray.toString(result[1]).trim();
-        if (!stdout)
-            return null;
-        first = stdout.split('\n')[0].trim();
-        return { pct: clampPercent(first), source: 'nvidia-smi' };
-    } catch (e) {
-        return null;
-    }
-}
-
 function QuotaHaloUsageIndicator() {
     this._init();
 }
@@ -1513,17 +1490,8 @@ QuotaHaloUsageIndicator.prototype = {
         Main.panel.statusArea['quotahalo-usage'] = this;
         this._writeDebug('init');
         this._update();
-        this._startupRefreshTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, function() {
-            self._startupRefreshTimeoutId = 0;
-            self._requestRefresh(false);
-            return GLib.SOURCE_REMOVE;
-        });
         this._timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, function() {
             return self._update();
-        });
-        this._refreshTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, USAGE_REFRESH_SECONDS, function() {
-            self._requestRefresh(false);
-            return true;
         });
         GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, function() {
             self._writeDebug('post-init');
@@ -2868,7 +2836,7 @@ QuotaHaloSystemIndicator.prototype = {
 
         if (this._gpuCache.at && now - this._gpuCache.at < GPU_CACHE_USEC)
             return this._gpuCache;
-        gpu = readGpuBusyFromSysfs() || readGpuBusyFromNvidiaSmi() || {
+        gpu = readGpuBusyFromSysfs() || {
             pct: 0,
             source: 'unavailable',
         };

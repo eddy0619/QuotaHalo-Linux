@@ -1,10 +1,10 @@
 [Unit]
-Description=Refresh QuotaHalo usage cache every 30 seconds
+Description=Refresh QuotaHalo usage cache every 5 minutes
 
 [Timer]
-OnActiveSec=1s
-OnUnitActiveSec=30s
-AccuracySec=1s
+OnActiveSec=30s
+OnUnitActiveSec=5min
+AccuracySec=15s
 Unit=quotahalo-refresh.service
 Persistent=false
 

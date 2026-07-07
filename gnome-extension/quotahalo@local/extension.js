@@ -96,6 +96,8 @@ var CLAUDE_ICON_PATH = GLib.build_filenamev([Me.path, 'claude-icon.png']);
 var COPILOT_ICON_PATH = GLib.build_filenamev([Me.path, 'github-copilot-icon.png']);
 var SYSTEM_UPDATE_SECONDS = 2;
 var GPU_CACHE_USEC = 3 * 1000 * 1000;
+var NVIDIA_SMI_PATH = '/usr/bin/nvidia-smi';
+var NVIDIA_SMI_TIMEOUT_SECONDS = 2;
 var PROXY_IPINFO_URL = 'https://ipinfo.io/json';
 var PROXY_UPDATE_SECONDS = 60;
 var PROXY_CANDIDATES = [
@@ -762,6 +764,28 @@ function friendlyErrorText(message, providerName) {
     return compactErrorText(parsed.message || text);
 }
 
+function isAuthenticationErrorText(message) {
+    var text = String(message || '');
+    var lower = text.toLowerCase();
+    var parsed = parsedHttpError(text);
+
+    return parsed.code === 401 ||
+        parsed.type === 'authentication_error' ||
+        lower.indexOf('could not authenticate') >= 0 ||
+        lower.indexOf('not authenticated') >= 0 ||
+        lower.indexOf('sign in') >= 0;
+}
+
+function claudeStaleAuthReminderText(status) {
+    var error = statusErrorText(status);
+
+    if (!status || !status.stale || !error)
+        return '';
+    if (!isAuthenticationErrorText(error))
+        return '';
+    return 'Quota data is stale. Sign in to Claude and refresh.';
+}
+
 function providerIconPath(providerName) {
     var name = String(providerName || '').toLowerCase();
 
@@ -1233,6 +1257,25 @@ function readGpuBusyFromSysfs() {
             }
         }
     } catch (e) {
+    }
+    return null;
+}
+
+function nvidiaSmiCommand() {
+    if (GLib.file_test(NVIDIA_SMI_PATH, GLib.FileTest.EXISTS))
+        return NVIDIA_SMI_PATH;
+    return 'nvidia-smi';
+}
+
+function parseNvidiaSmiGpuPercent(text) {
+    var lines = String(text || '').split('\n');
+    var i;
+    var match;
+
+    for (i = 0; i < lines.length; i++) {
+        match = lines[i].match(/(\d+(?:\.\d+)?)/);
+        if (match)
+            return clampPercent(match[1]);
     }
     return null;
 }
@@ -1914,7 +1957,7 @@ QuotaHaloUsageIndicator.prototype = {
         this._setProviderHeaderLines(
             this._claudeHeader,
             providerHeaderMetaText(claude, 'claude'),
-            '');
+            claudeStaleAuthReminderText(claude));
         if (!hasClaudeQuota(claude)) {
             setItemVisible(this._claudeItem.item, false);
             setItemVisible(this._claudeWeeklyItem.item, false);
@@ -1948,11 +1991,11 @@ QuotaHaloUsageIndicator.prototype = {
         var error = statusErrorText(status);
         var key;
 
+        if (!forceNotify)
+            return;
         if (!error)
             return;
         key = String(providerName) + ':' + error;
-        if (!forceNotify && this._notifiedProviderErrorKeys[key])
-            return;
         this._notifiedProviderErrorKeys[key] = true;
         this._showPersistentNotification(
             'QuotaHalo ' + providerName,
@@ -2489,7 +2532,9 @@ QuotaHaloSystemIndicator.prototype = {
         this._openChangedId = 0;
         this._prevCpu = null;
         this._prevNet = null;
-        this._gpuCache = { pct: 0, source: 'unknown', at: 0 };
+        this._gpuCache = { pct: 0, source: 'unavailable', at: 0 };
+        this._gpuQueryPending = false;
+        this._gpuQueryTimeoutId = 0;
         this._ifaces = [];
         this._flclashInfo = null;
         this._flclashError = null;
@@ -2832,17 +2877,94 @@ QuotaHaloSystemIndicator.prototype = {
 
     _readGpuPercent: function() {
         var now = GLib.get_monotonic_time();
-        var gpu;
 
         if (this._gpuCache.at && now - this._gpuCache.at < GPU_CACHE_USEC)
             return this._gpuCache;
-        gpu = readGpuBusyFromSysfs() || {
-            pct: 0,
-            source: 'unavailable',
-        };
-        gpu.at = now;
-        this._gpuCache = gpu;
-        return gpu;
+        this._requestNvidiaSmiGpuPercent();
+        return this._gpuCache;
+    },
+
+    _requestNvidiaSmiGpuPercent: function() {
+        var self = this;
+        var command;
+        var proc;
+        var timedOut = false;
+
+        if (this._gpuQueryPending)
+            return;
+
+        command = [
+            nvidiaSmiCommand(),
+            '--query-gpu=utilization.gpu',
+            '--format=csv,noheader,nounits',
+        ];
+        this._gpuQueryPending = true;
+
+        try {
+            proc = Gio.Subprocess.new(
+                command,
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+        } catch (e) {
+            this._gpuQueryPending = false;
+            this._gpuCache = {
+                pct: 0,
+                source: 'unavailable',
+                at: GLib.get_monotonic_time(),
+            };
+            return;
+        }
+
+        this._gpuQueryTimeoutId = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT,
+            NVIDIA_SMI_TIMEOUT_SECONDS,
+            function() {
+                timedOut = true;
+                self._gpuQueryTimeoutId = 0;
+                try {
+                    proc.force_exit();
+                } catch (e) {
+                }
+                self._gpuQueryPending = false;
+                self._gpuCache = {
+                    pct: 0,
+                    source: 'unavailable',
+                    at: GLib.get_monotonic_time(),
+                };
+                self._update();
+                return GLib.SOURCE_REMOVE;
+            });
+
+        proc.communicate_utf8_async(null, null, function(subprocess, res) {
+            var result;
+            var ok = false;
+            var stdout = '';
+            var pct = null;
+
+            if (self._gpuQueryTimeoutId) {
+                GLib.Source.remove(self._gpuQueryTimeoutId);
+                self._gpuQueryTimeoutId = 0;
+            }
+            if (timedOut)
+                return;
+
+            try {
+                result = subprocess.communicate_utf8_finish(res);
+                ok = result[0] && subprocess.get_successful();
+                stdout = result[1] || '';
+                if (ok)
+                    pct = parseNvidiaSmiGpuPercent(stdout);
+            } catch (e) {
+                pct = null;
+            }
+
+            self._gpuQueryPending = false;
+            self._gpuCache = {
+                pct: pct === null ? 0 : pct,
+                source: pct === null ? 'unavailable' : 'nvidia-smi',
+                at: GLib.get_monotonic_time(),
+            };
+            self._update();
+        });
     },
 
     _locationText: function(info) {
@@ -3101,8 +3223,7 @@ QuotaHaloSystemIndicator.prototype = {
         this._detectFlClash();
         this._cpuValue.set_text(pctText(cpu));
         this._memValue.set_text(pctText(mem.pct));
-        this._gpuValue.set_text(hasGpu ? pctText(gpu.pct) : unavailablePctText());
-        setItemVisible(this._gpuValue.segment, hasGpu);
+        this._gpuValue.set_text(hasGpu ? pctText(gpu.pct) : '--');
         this._lastNet = net;
         this._updateNetworkLabel(net);
 
@@ -3122,7 +3243,6 @@ QuotaHaloSystemIndicator.prototype = {
             mem.pct,
             String(Math.round(clampPercent(mem.pct))) + '%',
             formatBytes(mem.used) + ' / ' + formatBytes(mem.total));
-        setItemVisible(this._gpuItem.item, hasGpu);
         this._setMetricDetailRow(
             this._gpuItem,
             hasGpu ? gpu.pct : 0,
@@ -3157,6 +3277,10 @@ QuotaHaloSystemIndicator.prototype = {
         if (this._flclashTimeoutId) {
             GLib.Source.remove(this._flclashTimeoutId);
             this._flclashTimeoutId = 0;
+        }
+        if (this._gpuQueryTimeoutId) {
+            GLib.Source.remove(this._gpuQueryTimeoutId);
+            this._gpuQueryTimeoutId = 0;
         }
         if (this.menu) {
             this.menu.destroy();

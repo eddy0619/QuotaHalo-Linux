@@ -631,9 +631,26 @@ class RefreshBehaviorTests(unittest.TestCase):
 
         self.assertNotIn("USAGE_REFRESH_SECONDS", extension_text)
         self.assertNotIn("self._requestRefresh(false);", extension_text)
-        self.assertNotIn("nvidia-smi", extension_text)
         self.assertIn("OnUnitActiveSec=5min", timer_text)
         self.assertIn("TimeoutStartSec=120", service_text)
+
+    def test_system_gpu_uses_async_nvidia_smi_with_timeout(self):
+        extension_text = (
+            Path(__file__).resolve().parents[1]
+            / "gnome-extension"
+            / "quotahalo@local"
+            / "extension.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("NVIDIA_SMI_TIMEOUT_SECONDS = 2", extension_text)
+        self.assertIn("'nvidia-smi'", extension_text)
+        self.assertIn("'--query-gpu=utilization.gpu'", extension_text)
+        self.assertIn("_requestNvidiaSmiGpuPercent", extension_text)
+        self.assertIn("communicate_utf8_async", extension_text)
+        self.assertIn("force_exit", extension_text)
+        self.assertIn("this._gpuValue.set_text(hasGpu ? pctText(gpu.pct) : '--')", extension_text)
+        self.assertNotIn("setItemVisible(this._gpuValue.segment, hasGpu)", extension_text)
+        self.assertNotIn("setItemVisible(this._gpuItem.item, hasGpu)", extension_text)
 
     def test_extension_notifies_manual_refresh_failures(self):
         extension_path = (
@@ -662,7 +679,9 @@ class RefreshBehaviorTests(unittest.TestCase):
         self.assertIn("_setCodexDetails(status, !!forceNotify)", text)
         self.assertIn("_setClaudeDetails(status, !!forceNotify)", text)
         self.assertIn("_notifyProviderError('Claude', claude, forceNotify)", text)
-        self.assertIn("!forceNotify && this._notifiedProviderErrorKeys[key]", text)
+        self.assertIn("if (!forceNotify)\n            return;", text)
+        self.assertIn("claudeStaleAuthReminderText", text)
+        self.assertIn("Quota data is stale. Sign in to Claude and refresh.", text)
         self.assertIn("providerIconPath(providerName)", text)
         self.assertIn("source.createIcon = function(size)", text)
         self.assertIn("new Gio.FileIcon", text)

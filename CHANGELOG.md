@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.2.3 - 2026-07-13
+
+- Updated Codex quota parsing for the new weekly-only rate limit format.
+- Hid the obsolete 5h Codex session row when the session window is no longer present.
+- Read the active Codex model from local session context instead of the default config value.
+
 ## v0.2.2 - 2026-07-02
 
 - Reduced desktop load by moving automatic quota refresh out of GNOME Shell, slowing the background timer, bounding Codex cost scans, and avoiding synchronous GPU command calls.

@@ -40,6 +40,7 @@ CLAUDE_OAUTH_BACKOFF_SECONDS = 300
 USAGE_QUERY_PROMPTS = {"/usage", "usage"}
 CODEX_COST_SCAN_DAYS = 10
 CODEX_COST_SCAN_MAX_FILES = 80
+CODEX_WEEKLY_WINDOW_MINUTES = 7 * 24 * 60
 
 
 class ManualRefreshDiagnostics:
@@ -1285,6 +1286,18 @@ def _remaining_pct(used_pct):
     return 100 - _clamp_pct(used_pct)
 
 
+def _optional_pct(value):
+    if value is None:
+        return None
+    return _clamp_pct(value)
+
+
+def _optional_remaining_pct(value):
+    if value is None:
+        return None
+    return _remaining_pct(value)
+
+
 def _compact_reset(reset_value):
     if not reset_value or reset_value == "unknown":
         return "--"
@@ -1430,12 +1443,20 @@ class CodexDataFetcher:
 
         latest_limits = None
         latest_limits_updated = None
+        latest_model = ""
+        latest_model_updated = None
+        latest_model_sort_key = -1
         checked_files = 0
         for jf in jsonl_files:
             checked_files += 1
-            rate_limits = self._extract_rate_limits(jf, diagnostics=diagnostics)
-            if rate_limits:
-                limits, updated, _sort_key = rate_limits
+            signals = self._extract_session_signals(jf, diagnostics=diagnostics)
+            if signals.get("model") and signals.get("model_sort_key", -1) > latest_model_sort_key:
+                latest_model = signals["model"]
+                latest_model_updated = signals.get("model_updated")
+                latest_model_sort_key = signals.get("model_sort_key", -1)
+            if signals.get("rate_limits") and latest_limits is None:
+                limits = signals["rate_limits"]
+                updated = signals.get("rate_limits_updated")
                 latest_limits = limits
                 latest_limits_updated = updated
                 if diagnostics:
@@ -1447,15 +1468,42 @@ class CodexDataFetcher:
                         has_primary=bool(limits.get("primary")),
                         has_secondary=bool(limits.get("secondary")),
                     )
+            if latest_limits is not None and latest_model:
                 break
+
+        if latest_model:
+            d["model"] = latest_model
+            if diagnostics:
+                diagnostics.log(
+                    "Codex model selected",
+                    level="DEBUG",
+                    checked_files=checked_files,
+                    updated=latest_model_updated,
+                    model=bool(latest_model),
+                )
 
         if latest_limits:
             rl = latest_limits
             primary = rl.get("primary", {})
-            if primary:
-                self._apply_rate_limit(d, primary, "session")
             secondary = rl.get("secondary", {})
-            if secondary:
+            if primary and secondary:
+                self._apply_rate_limit(d, primary, "session")
+                self._apply_rate_limit(d, secondary, "weekly")
+            elif primary:
+                if self._is_weekly_rate_limit(primary):
+                    d["session_used_pct"] = None
+                    d["session_reset"] = "unknown"
+                    d["session_reset_epoch"] = None
+                    self._apply_rate_limit(d, primary, "weekly")
+                else:
+                    self._apply_rate_limit(d, primary, "session")
+                    d["weekly_used_pct"] = None
+                    d["weekly_reset"] = "unknown"
+                    d["weekly_reset_epoch"] = None
+            elif secondary:
+                d["session_used_pct"] = None
+                d["session_reset"] = "unknown"
+                d["session_reset_epoch"] = None
                 self._apply_rate_limit(d, secondary, "weekly")
             plan = rl.get("plan_type", "")
             if plan:
@@ -1536,11 +1584,15 @@ class CodexDataFetcher:
         return selected
 
     @staticmethod
-    def _extract_rate_limits(jsonl_path, diagnostics=None):
-        best = None
-        best_updated = None
-        best_sort_key = -1
+    def _extract_session_signals(jsonl_path, diagnostics=None):
+        best_limits = None
+        best_limits_updated = None
+        best_limits_sort_key = -1
+        best_model = ""
+        best_model_updated = None
+        best_model_sort_key = -1
         matching_lines = 0
+        model_lines = 0
         token_count_events = 0
         rate_limit_events = 0
         empty_rate_limit_events = 0
@@ -1549,12 +1601,21 @@ class CodexDataFetcher:
             with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as fh:
                 for line in fh:
                     line = line.strip()
-                    if not line or "rate_limits" not in line:
+                    if not line or ("rate_limits" not in line and '"model"' not in line):
                         continue
                     matching_lines += 1
                     try:
                         e = json.loads(line)
                         p = e.get("payload", {})
+                        model = CodexDataFetcher._extract_event_model(p)
+                        if model:
+                            model_lines += 1
+                            model_updated, model_sort_key = CodexDataFetcher._format_event_time(
+                                e.get("timestamp"), jsonl_path)
+                            if model_sort_key > best_model_sort_key:
+                                best_model = model
+                                best_model_updated = model_updated
+                                best_model_sort_key = model_sort_key
                         if isinstance(p, dict) and p.get("type") == "token_count":
                             token_count_events += 1
                             rl = p.get("rate_limits")
@@ -1565,31 +1626,64 @@ class CodexDataFetcher:
                                     continue
                                 updated, sort_key = CodexDataFetcher._format_event_time(
                                     e.get("timestamp"), jsonl_path)
-                                if sort_key > best_sort_key:
-                                    best = rl
-                                    best_updated = updated
-                                    best_sort_key = sort_key
+                                if sort_key > best_limits_sort_key:
+                                    best_limits = rl
+                                    best_limits_updated = updated
+                                    best_limits_sort_key = sort_key
                     except Exception:
                         invalid_lines += 1
         except Exception as e:
             if diagnostics:
-                diagnostics.exception("Codex rate limit file read failed", e, level="WARN", path=jsonl_path)
-        if diagnostics and (matching_lines or invalid_lines or best):
+                diagnostics.exception("Codex session file read failed", e, level="WARN", path=jsonl_path)
+        if diagnostics and (matching_lines or invalid_lines or best_limits or best_model):
             diagnostics.log(
-                "Codex rate limit file scanned",
+                "Codex session file scanned",
                 level="DEBUG",
                 path=jsonl_path,
                 matching_lines=matching_lines,
+                model_lines=model_lines,
                 token_count_events=token_count_events,
                 rate_limit_events=rate_limit_events,
                 empty_rate_limit_events=empty_rate_limit_events,
                 invalid_lines=invalid_lines,
-                found=bool(best),
-                updated=best_updated,
+                found_rate_limits=bool(best_limits),
+                found_model=bool(best_model),
+                updated=best_limits_updated,
             )
-        if not best:
+        return {
+            "rate_limits": best_limits,
+            "rate_limits_updated": best_limits_updated,
+            "rate_limits_sort_key": best_limits_sort_key,
+            "model": best_model,
+            "model_updated": best_model_updated,
+            "model_sort_key": best_model_sort_key,
+        }
+
+    @staticmethod
+    def _extract_rate_limits(jsonl_path, diagnostics=None):
+        signals = CodexDataFetcher._extract_session_signals(jsonl_path, diagnostics=diagnostics)
+        if not signals.get("rate_limits"):
             return None
-        return best, best_updated, best_sort_key
+        return (
+            signals.get("rate_limits"),
+            signals.get("rate_limits_updated"),
+            signals.get("rate_limits_sort_key", -1),
+        )
+
+    @staticmethod
+    def _extract_event_model(payload):
+        if not isinstance(payload, dict):
+            return ""
+        model = payload.get("model")
+        if not model:
+            collaboration_mode = payload.get("collaboration_mode")
+            if isinstance(collaboration_mode, dict):
+                settings = collaboration_mode.get("settings")
+                if isinstance(settings, dict):
+                    model = settings.get("model")
+        if not model:
+            return ""
+        return str(model).strip()
 
     @staticmethod
     def _has_rate_limit_window(rate_limits):
@@ -1598,6 +1692,15 @@ class CodexDataFetcher:
         return isinstance(rate_limits.get("primary"), dict) or isinstance(
             rate_limits.get("secondary"), dict
         )
+
+    @staticmethod
+    def _is_weekly_rate_limit(rate_limit):
+        if not isinstance(rate_limit, dict):
+            return False
+        try:
+            return int(rate_limit.get("window_minutes") or 0) >= CODEX_WEEKLY_WINDOW_MINUTES
+        except Exception:
+            return False
 
     @staticmethod
     def _to_epoch(value):
@@ -1696,7 +1799,10 @@ def _provider_label(data):
         return "Codex --"
     if data.get("source") in ("none", "config"):
         return "Codex --"
-    return f"Codex {_clamp_pct(data.get('session_used_pct', 0))}%"
+    used_pct = data.get("session_used_pct")
+    if used_pct is None:
+        used_pct = data.get("weekly_used_pct")
+    return f"Codex {_clamp_pct(used_pct)}%"
 
 
 def _provider_title(data):
@@ -1705,13 +1811,16 @@ def _provider_title(data):
     if data.get("source") in ("none", "config"):
         return "QuotaHalo - Codex usage unavailable"
 
-    session = _clamp_pct(data.get("session_used_pct", 0))
-    weekly = _clamp_pct(data.get("weekly_used_pct", 0))
-    title = (
-        "QuotaHalo - Codex Quota: "
-        f"Session {session}% used ({_remaining_pct(session)}% remaining), "
-        f"Weekly {weekly}% used ({_remaining_pct(weekly)}% remaining)"
-    )
+    quota_parts = []
+    if data.get("session_used_pct") is not None:
+        session = _clamp_pct(data.get("session_used_pct", 0))
+        quota_parts.append(f"Session {session}% used ({_remaining_pct(session)}% remaining)")
+    if data.get("weekly_used_pct") is not None:
+        weekly = _clamp_pct(data.get("weekly_used_pct", 0))
+        quota_parts.append(f"Weekly {weekly}% used ({_remaining_pct(weekly)}% remaining)")
+    if not quota_parts:
+        return "QuotaHalo - Codex usage unavailable"
+    title = "QuotaHalo - Codex Quota: " + ", ".join(quota_parts)
     session_reset = data.get("session_reset")
     weekly_reset = data.get("weekly_reset")
     if session_reset and session_reset != "unknown":
@@ -1724,7 +1833,7 @@ def _provider_title(data):
 def _has_codex_quota(data):
     if data.get("source") != "sessions":
         return False
-    return data.get("session_used_pct") is not None
+    return data.get("session_used_pct") is not None or data.get("weekly_used_pct") is not None
 
 
 def _has_claude_quota(data):
@@ -1746,12 +1855,12 @@ def _panel_status_payload(claude, codex, update_status=None):
         "updated_epoch": codex.get("updated_epoch"),
         "plan": codex.get("plan", ""),
         "model": codex.get("model", ""),
-        "session_used_pct": _clamp_pct(codex.get("session_used_pct", 0)),
-        "session_remaining_pct": _remaining_pct(codex.get("session_used_pct", 0)),
+        "session_used_pct": _optional_pct(codex.get("session_used_pct")),
+        "session_remaining_pct": _optional_remaining_pct(codex.get("session_used_pct")),
         "session_reset": _compact_reset(codex.get("session_reset")),
         "session_reset_epoch": codex.get("session_reset_epoch"),
-        "weekly_used_pct": _clamp_pct(codex.get("weekly_used_pct", 0)),
-        "weekly_remaining_pct": _remaining_pct(codex.get("weekly_used_pct", 0)),
+        "weekly_used_pct": _optional_pct(codex.get("weekly_used_pct")),
+        "weekly_remaining_pct": _optional_remaining_pct(codex.get("weekly_used_pct")),
         "weekly_reset": _compact_reset(codex.get("weekly_reset")),
         "weekly_reset_epoch": codex.get("weekly_reset_epoch"),
         "cost_today": codex.get("cost_today", 0),

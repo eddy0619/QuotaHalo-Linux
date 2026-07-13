@@ -145,7 +145,7 @@ class RefreshBehaviorTests(unittest.TestCase):
             )
             self.assertTrue(payload["claude"]["stale"])
 
-    def test_codex_uses_latest_rate_limit_event(self):
+    def test_codex_uses_weekly_primary_rate_limit_and_latest_model_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             codex_dir = Path(tmp) / ".codex"
             sessions_dir = codex_dir / "sessions"
@@ -163,6 +163,7 @@ class RefreshBehaviorTests(unittest.TestCase):
                             "rate_limits": {
                                 "primary": {
                                     "used_percent": 90,
+                                    "window_minutes": 10080,
                                     "resets_at": now_epoch + 7200,
                                 }
                             },
@@ -181,8 +182,25 @@ class RefreshBehaviorTests(unittest.TestCase):
                             "rate_limits": {
                                 "primary": {
                                     "used_percent": 12,
+                                    "window_minutes": 10080,
                                     "resets_at": now_epoch + 3600,
                                 }
+                            },
+                        },
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "timestamp": "2026-06-10T09:01:00Z",
+                        "type": "turn_context",
+                        "payload": {
+                            "model": "gpt-5.5",
+                            "collaboration_mode": {
+                                "settings": {
+                                    "model": "gpt-5.5",
+                                    "reasoning_effort": "high",
+                                },
                             },
                         },
                     }
@@ -201,7 +219,10 @@ class RefreshBehaviorTests(unittest.TestCase):
                 qhs.CodexDataFetcher.CODEX_DIR = original_codex_dir
 
             self.assertEqual(data["source"], "sessions")
-            self.assertEqual(data["session_used_pct"], 12)
+            self.assertIsNone(data["session_used_pct"])
+            self.assertEqual(data["session_reset"], "unknown")
+            self.assertEqual(data["weekly_used_pct"], 12)
+            self.assertEqual(data["model"], "gpt-5.5")
 
     def test_codex_ignores_empty_latest_rate_limit_event(self):
         with tempfile.TemporaryDirectory() as tmp:

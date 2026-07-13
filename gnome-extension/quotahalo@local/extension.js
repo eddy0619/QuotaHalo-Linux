@@ -240,6 +240,10 @@ function clampPercent(value) {
     return n;
 }
 
+function hasUsagePercent(status, usedKey) {
+    return !!(status && status[usedKey] !== undefined && status[usedKey] !== null);
+}
+
 function resetEpochFor(status, usedKey) {
     var key;
     var n;
@@ -504,15 +508,18 @@ function hasCodexQuota(status) {
         return false;
     if (status.source === 'none' || status.source === 'config')
         return false;
-    return status.session_used_pct !== undefined && status.session_used_pct !== null;
+    return hasUsagePercent(status, 'session_used_pct') || hasUsagePercent(status, 'weekly_used_pct');
 }
 
 function codexLabelText(status) {
+    var key;
+
     if (!hasCodexProvider(status))
         return '';
     if (!hasCodexQuota(status))
         return '--';
-    return String(Math.round(usedPercent(status, 'session_used_pct'))) + '%';
+    key = hasUsagePercent(status, 'session_used_pct') ? 'session_used_pct' : 'weekly_used_pct';
+    return String(Math.round(usedPercent(status, key))) + '%';
 }
 
 function panelLabelText(status) {
@@ -530,7 +537,7 @@ function hasClaudeQuota(status) {
     if (status.source === 'none' || status.source === 'config' ||
         status.source === 'logs' || status.source === 'credentials')
         return false;
-    return status.session_used_pct !== undefined && status.session_used_pct !== null;
+    return hasUsagePercent(status, 'session_used_pct');
 }
 
 function claudeLabelText(status) {
@@ -1887,6 +1894,9 @@ QuotaHaloUsageIndicator.prototype = {
     },
 
     _setCodexDetails: function(status, forceNotify) {
+        var hasSession;
+        var hasWeekly;
+
         if (!hasCodexProvider(status)) {
             setItemVisible(this._codexHeader.item, false);
             setItemVisible(this._sessionItem.item, false);
@@ -1910,23 +1920,29 @@ QuotaHaloUsageIndicator.prototype = {
             return true;
         }
 
-        setItemVisible(this._sessionItem.item, true);
-        setItemVisible(this._weeklyItem.item, true);
+        hasSession = hasUsagePercent(status, 'session_used_pct');
+        hasWeekly = hasUsagePercent(status, 'weekly_used_pct');
+        setItemVisible(this._sessionItem.item, hasSession);
+        setItemVisible(this._weeklyItem.item, hasWeekly);
         setItemVisible(this._codexUnavailableItem.item, false);
-        this._setUsageDetailRow(
-            this._sessionItem,
-            status,
-            'session_used_pct',
-            'session_remaining_pct',
-            status.session_reset,
-            true);
-        this._setUsageDetailRow(
-            this._weeklyItem,
-            status,
-            'weekly_used_pct',
-            'weekly_remaining_pct',
-            status.weekly_reset,
-            true);
+        if (hasSession) {
+            this._setUsageDetailRow(
+                this._sessionItem,
+                status,
+                'session_used_pct',
+                'session_remaining_pct',
+                status.session_reset,
+                true);
+        }
+        if (hasWeekly) {
+            this._setUsageDetailRow(
+                this._weeklyItem,
+                status,
+                'weekly_used_pct',
+                'weekly_remaining_pct',
+                status.weekly_reset,
+                true);
+        }
         return true;
     },
 
